@@ -1,989 +1,1267 @@
 import asyncio
-import copy
+import datetime
 import html
+import io
 import json
-import logging
 import os
 import re
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from logging.handlers import RotatingFileHandler
 
-from telethon import Button, TelegramClient, events
+from telethon import Button, TelegramClient, events, functions, types
 from telethon.tl.types import MessageEntityTextUrl
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ARQUIVO_ENV = os.path.join(BASE_DIR, ".env")
-ARQUIVO_JSON = os.path.join(BASE_DIR, "banco_de_dados.json")
-PASTA_LOGS = os.path.join(BASE_DIR, "logs")
-ARQUIVO_LOG = os.path.join(PASTA_LOGS, "bot.log")
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+from core import (
+    ARQUIVO_ESTADO,
+    ARQUIVO_JSON,
+    ARQUIVO_LOG,
+    BASE_DIR,
+    PROMPTS_ADICIONAR,
+    TECLADO_FIXO_SPEC,
+    TEXTOS_TECLADO_FIXO,
+    WIZARD_CATEGORIAS,
+    alerta_eh_vago,
+    alternar_prioridade_palavra,
+    avaliar_gatilhos,
+    buscar_metadados_pagina,
+    carregar_configuracoes,
+    carregar_dados,
+    carregar_estado_persistente,
+    disparar_macrodroid,
+    eh_horario_dnd,
+    escolher_link_oferta,
+    esta_no_historico,
+    expandir_link,
+    extrair_cupons,
+    extrair_links_mensagem,
+    formatar_faixa_preco,
+    formatar_lista_numerada,
+    formatar_resumo_diario,
+    garantir_stats_do_dia,
+    gerar_url_comparacao,
+    hash_curto_chave,
+    identificar_produto,
+    ler_ultimas_linhas_log,
+    logger,
+    migrar_estrutura_dados,
+    montar_chave_duplicata,
+    montar_mensagem_e_botoes_spec,
+    montar_painel_menu_spec,
+    montar_painel_palavras_prio_spec,
+    montar_painel_prioridades_spec,
+    montar_wizard_categoria_spec,
+    montar_wizard_remover_itens_spec,
+    normalizar_faixa_preco,
+    palavra_eh_alta,
+    parsear_comando_composto,
+    parsear_faixa_preco,
+    regex_valida,
+    registrar_alerta_enviado,
+    registrar_historico,
+    remover_chaves_dict,
+    remover_compostos,
+    remover_itens_lista,
+    salvar_dados,
+    salvar_estado_persistente,
 )
 
-DADOS_PADRAO = {
-    "canais": [
-        "@promonationchat", "@NerdCupons", "@TJGOFERTASs", "@Radar_BugS_e_Ofertas",
-        "@promocoeseachadinhos", "@viciadopromocao", "@nerdofertas", "@chinasuperofertas",
-        "@promocoes", "@cupons", "@aliexpressb", "@ofertabrasil", "@ofertasbr",
-        "@canaltech", "@meliuz", "@canalbr", "@Pedro_Indica", "@PedroIndicaChat", "@JuliaSaliba",
-    ],
-    "palavras": [
-        r"\bbug\b", r"\bbugs\b", r"\bbugou\b", r"\bbugado\b",
-        r"erro de pre[çc]o", r"pre[çc]o errado", r"erro de digita[çc][ãa]o",
-        r"\bestagi[áa]rio\b", r"\bcorram+\b", r"\bcorre+\b",
-        r"\bimperd[íi]vel\b", r"\bsurreal\b", r"de gra[çc]a", r"\bdado\b",
-        r"100% off", r"90% off", r"desconto absurdo", r"\bpre[çc]o vil\b",
-    ],
-    "negativas": [
-        r"\besgotado\b", r"\bacabou\b", r"\bencerrou\b",
-        r"\bfinalizado\b", r"\bsem estoque\b", r"\bfoi se\b",
-    ],
-    "alvos_preco": {},
-    "alvos_compostos": [],
-    "desconto_minimo": 65.0,
+ALIASES_COMANDO = {
+    "/m": "/menu",
+    "/h": "/ajuda",
+    "/help": "/ajuda",
+    "/l": "/lista",
+    "/s": "/status",
+    "/p": "/pausar",
+    "/r": "/retomar",
+    "/ac": "/addcanal",
+    "/dc": "/delcanal",
+    "/ap": "/addpalavra",
+    "/dp": "/delpalavra",
+    "/ab": "/addbloqueio",
+    "/db": "/delbloqueio",
+    "/at": "/addteto",
+    "/dt": "/delteto",
+    "/ax": "/addcomposto",
+    "/dx": "/delcomposto",
+    "/sd": "/setdesconto",
+    "/prio": "/prioridade",
+    "/t": "/teste",
+    "/u": "/ultimos",
+    "/b": "/backup",
+    "/res": "/resumo",
 }
 
-STOPWORDS_CUPOM = {
-    "NO", "NA", "NOS", "NAS", "DO", "DA", "DOS", "DAS", "DE", "EM", "UM", "UMA",
-    "COM", "POR", "PARA", "PRA", "QUE", "SEU", "SUA", "AQUI", "LINK", "SITE", "APP",
-    "LOJA", "HOJE", "AGORA", "ABAIXO", "ACIMA", "FOTO", "IMAGEM", "ATIVAR", "ATIVE",
-    "RESGATAR", "RESGATE", "APLICAR", "APLICADO", "AUTOMATICAMENTE", "AUTOMATICO",
-    "SELECIONAR", "SELECIONE", "DISPONIVEL", "PAGINA", "ANUNCIO", "CLIQUE", "PEGUE",
-    "USE", "OFF", "REAIS", "DESCONTO", "CUPOM", "CODIGO", "VALOR", "FRETE", "GRATIS",
-    "PRIME", "PIX", "CARTAO", "CARRINHO", "PAGAMENTO", "PRODUTO", "OFERTA", "PROMO",
-    "PROMOCAO",
-}
-
-ENCURTADORES_E_LOJAS = (
-    "amzn.to", "a.co", "amazon.",
-    "meli.la", "mercadolivre.",
-    "s.shopee.", "shp.ee", "shopee.",
-    "divulgador.magalu.", "parceiro.magalu.", "magazineluiza.", "magalu.",
-    "kabum.", "tidd.ly", "awin1.",
-    "s.click.aliexpress.", "a.aliexpress.", "aliexpress.",
-    "bit.ly", "tinyurl.com", "cutt.ly", "is.gd", "bityli.com", "ofertou.com",
-)
-
-PARAMS_TRACKING = {
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
-    "fbclid", "gclid", "dclid", "msclkid", "ref", "ref_", "tag", "linkcode",
-    "camp", "creative", "creativeasin", "psc", "th", "matt_tool", "matt_word",
-    "matt_source", "matt_campaign_id", "matt_ad_group_id", "matt_match_type",
-    "matt_network", "matt_device", "matt_creative", "matt_keyword", "matt_ad_id",
-    "matt_ad_position", "matt_placement", "pdp_filters", "searchvariation",
-    "position", "search_layout", "type", "tracking_id", "is_from_login",
-    "sp_atk", "xptdk", "spm", "aff_fcid", "aff_fsk", "aff_platform", "sk",
-    "partner_id", "seller_id",
-}
-
-PARAMS_REDIRECT = ("url", "u", "redir", "redirect", "target", "ued", "destination")
-
-REGEX_CUPOM = re.compile(
-    r"(?i)\b(cupom|c[oó]digo|c[oó]d\.?|voucher)"
-    r"(?:\s+(?:de\s+desconto|promocional|exclusivo|vip))?"
-    r"(?:[\s:=\-👇👉⬇️➡️🎟️🏷️*`\"'\r\n]+)"
-    r"([A-Za-z0-9][A-Za-z0-9_-]{2,24})"
-)
-
-REGEX_ASIN_AMAZON = re.compile(
-    r"(?:/dp/|/gp/product/|/gp/aw/d/|/aw/d/|/ASIN/|/product/)([A-Z0-9]{10})(?:[/?#]|$)",
-    re.IGNORECASE,
-)
+COMANDOS_BOT_MENU = [
+    ("menu", "Painel interativo com botões"),
+    ("teclado", "Mostrar teclado fixo na barra inferior"),
+    ("add", "Assistente para adicionar por botões"),
+    ("rem", "Assistente para remover por botões"),
+    ("prioridade", "Editar prioridades e faixas (Alta/Normal)"),
+    ("lista", "Listar canais, palavras e tetos numerados"),
+    ("status", "Resumo do dia e estado do bot"),
+    ("pausar", "Pausar ou retomar monitoramento"),
+    ("addteto", "Teto simples: /addteto item, min-max"),
+    ("addcomposto", "Combo: /addcomposto nome | inc | exc | min-max"),
+    ("addpalavra", "Adicionar palavra(s): /ap t1; t2"),
+    ("delpalavra", "Remover palavra por nº ou texto: /dp 1"),
+    ("addcanal", "Adicionar canal(is): /ac @c1 @c2"),
+    ("delcanal", "Remover canal por nº ou nome: /dc 1"),
+    ("dnd", "Modo madrugada: /dnd 0-7 ou off"),
+    ("filtro", "Filtros usados/importação"),
+    ("teste", "Testar alerta com botões e MacroDroid"),
+    ("backup", "Baixar backup JSON (envie .json para restaurar)"),
+    ("ajuda", "Ver todos os comandos e atalhos"),
+]
 
 
-def configurar_logger(caminho_log=ARQUIVO_LOG):
-    """Configura logs no console e em arquivo rotativo."""
-    logger_obj = logging.getLogger("bot_bugs")
-    if logger_obj.handlers:
-        return logger_obj
-
-    logger_obj.setLevel(logging.INFO)
-    os.makedirs(os.path.dirname(caminho_log), exist_ok=True)
-    formato = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    file_handler = RotatingFileHandler(
-        caminho_log, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
-    )
-    file_handler.setFormatter(formato)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formato)
-
-    logger_obj.addHandler(file_handler)
-    logger_obj.addHandler(stream_handler)
-    return logger_obj
-
-
-logger = configurar_logger()
-
-
-def carregar_env(caminho_env=ARQUIVO_ENV):
-    """Carrega variáveis de um arquivo .env para os.environ sem sobrescrever existentes."""
-    if not os.path.exists(caminho_env):
-        return False
-    with open(caminho_env, "r", encoding="utf-8") as arquivo:
-        for linha in arquivo:
-            linha = linha.strip()
-            if not linha or linha.startswith("#") or "=" not in linha:
-                continue
-            chave, valor = linha.split("=", 1)
-            chave = chave.strip()
-            valor = valor.strip().strip('"').strip("'")
-            if chave:
-                os.environ.setdefault(chave, valor)
-    return True
-
-
-def carregar_configuracoes(caminho_env=ARQUIVO_ENV):
-    """Lê e valida as credenciais e parâmetros do ambiente."""
-    carregar_env(caminho_env)
-    obrigatorias = ("API_ID", "API_HASH", "BOT_TOKEN", "MEU_CHAT_ID")
-    faltantes = [k for k in obrigatorias if not os.environ.get(k)]
-    if faltantes:
-        raise RuntimeError(
-            f"Variáveis obrigatórias ausentes no .env: {', '.join(faltantes)}"
-        )
-
-    return {
-        "API_ID": int(os.environ["API_ID"]),
-        "API_HASH": os.environ["API_HASH"],
-        "BOT_TOKEN": os.environ["BOT_TOKEN"],
-        "MEU_CHAT_ID": int(os.environ["MEU_CHAT_ID"]),
-        "URL_MACRODROID": os.environ.get("URL_MACRODROID", "").strip(),
-        "TEMPO_DE_ESPERA": int(os.environ.get("TEMPO_DE_ESPERA", "15")),
-        "TEMPO_DUPLICATA": int(os.environ.get("TEMPO_DUPLICATA", "900")),
-        "DESCONTO_MINIMO_AUTO": float(os.environ.get("DESCONTO_MINIMO_AUTO", "65")),
-    }
-
-
-def carregar_dados(caminho_json=ARQUIVO_JSON, desconto_padrao=None):
-    """Carrega e migra o banco JSON preservando dados existentes."""
-    if desconto_padrao is None:
-        desconto_padrao = float(os.environ.get("DESCONTO_MINIMO_AUTO", DADOS_PADRAO["desconto_minimo"]))
-
-    if os.path.exists(caminho_json):
-        with open(caminho_json, "r", encoding="utf-8") as f:
-            dados = json.load(f)
-        alterado = False
-        for chave, valor_padrao in DADOS_PADRAO.items():
-            if chave not in dados:
-                dados[chave] = desconto_padrao if chave == "desconto_minimo" else copy.deepcopy(valor_padrao)
-                alterado = True
-        if alterado:
-            salvar_dados(dados, caminho_json)
-        return dados
-
-    dados = copy.deepcopy(DADOS_PADRAO)
-    dados["desconto_minimo"] = desconto_padrao
-    return dados
-
-
-def salvar_dados(dados, caminho_json=ARQUIVO_JSON):
-    """Salva o banco JSON de forma atômica para evitar corrupção."""
-    pasta = os.path.dirname(os.path.abspath(caminho_json))
-    if pasta:
-        os.makedirs(pasta, exist_ok=True)
-    caminho_tmp = f"{caminho_json}.tmp"
-    with open(caminho_tmp, "w", encoding="utf-8") as f:
-        json.dump(dados, f, ensure_ascii=False, indent=4)
-    os.replace(caminho_tmp, caminho_json)
-
-
-def regex_valida(padrao):
-    """Valida se uma expressão regular compila sem erro."""
-    try:
-        re.compile(padrao, re.IGNORECASE)
-        return True, None
-    except re.error as err:
-        return False, str(err)
-
-
-def match_padrao(padrao, texto):
-    """Busca por regex (ou literal se a regex for inválida) ignorando maiúsculas."""
-    try:
-        return re.search(padrao, texto, re.IGNORECASE) is not None
-    except re.error:
-        return padrao.lower() in texto.lower()
-
-
-def parse_numero_br(numero_sujo):
-    """Converte string monetária BR/US (ex: '1.299,90' ou '199.90') para float."""
-    limpo = numero_sujo.strip(" .,\t\n\r")
-    if not limpo or not any(ch.isdigit() for ch in limpo):
+def converter_botoes_telethon(botoes_spec):
+    """Converte especificação de botões [(tipo, texto, valor?)] em objetos Button do Telethon."""
+    if not botoes_spec:
         return None
-
-    if "," in limpo:
-        limpo = limpo.replace(".", "").replace(",", ".")
-    elif "." in limpo:
-        partes = limpo.split(".")
-        if len(partes) > 2 or (len(partes) == 2 and len(partes[1]) == 3):
-            limpo = limpo.replace(".", "")
-
-    try:
-        valor = float(limpo)
-        return valor if valor > 0 else None
-    except ValueError:
-        return None
-
-
-def _eh_contexto_ignorado(contexto_antes, contexto_depois):
-    """Identifica se o valor monetário é parcela, cupom, frete ou cashback."""
-    if re.search(r"(?:\b\d+\s*x\s*(?:de\s*)?|\bparcela\w*\s*(?:de\s*)?)$", contexto_antes, re.IGNORECASE):
-        return True
-    if re.search(
-        r"(?:cupom|desconto|economize|economiza|ganhe|cashback|frete|acima\s+de|m[ií]nimo(?:\s+de)?|off\s+em)\s*(?:de\s*)?$",
-        contexto_antes,
-        re.IGNORECASE,
-    ):
-        return True
-    if re.search(
-        r"^\s*(?:off\b|de\s+desconto|de\s+cashback|em\s+cupom|de\s+economia)",
-        contexto_depois,
-        re.IGNORECASE,
-    ):
-        return True
-    return False
-
-
-def _eh_preco_antigo(contexto_antes):
-    """Verifica se o preço está marcado como valor anterior ('de R$', '~~R$', etc.)."""
-    return bool(
-        re.search(r"(?:\b(?:de|antes|era|custava)\s*:?\s*~{0,2}|~~\s*|[❌🔴]\s*)$", contexto_antes, re.IGNORECASE)
-    )
-
-
-def extrair_preco(texto):
-    """Extrai o menor preço atual válido, ignorando parcelas, descontos e 'de R$' quando há preço atual."""
-    atuais = []
-    todos_validos = []
-
-    for match in re.finditer(r"r\$\s*([\d\.,]+)", texto, re.IGNORECASE):
-        valor = parse_numero_br(match.group(1))
-        if valor is None:
-            continue
-        inicio, fim = match.span()
-        antes = texto[max(0, inicio - 30):inicio]
-        depois = texto[fim:min(len(texto), fim + 25)]
-
-        if _eh_contexto_ignorado(antes, depois):
-            continue
-
-        todos_validos.append(valor)
-        if not _eh_preco_antigo(antes):
-            atuais.append(valor)
-
-    if atuais:
-        return min(atuais)
-    if todos_validos:
-        return min(todos_validos)
-    return None
-
-
-def detectar_desconto_real(texto, desconto_minimo):
-    """Detecta queda real em padrões 'De R$ X por R$ Y' e retorna (pct, de, por) se >= mínimo."""
-    if not desconto_minimo or desconto_minimo <= 0:
-        return None
-
-    padroes = [
-        r"(?i)\b(?:de|antes|era|custava)\s*:?\s*~{0,2}r\$\s*([\d\.,]+)~{0,2}[\s\S]{0,80}?\b(?:por|agora|sai(?:\s+a|\s+por)?|apenas|s[óo]|hoje)\s*:?\s*r\$\s*([\d\.,]+)",
-        r"(?i)~~\s*r\$\s*([\d\.,]+)\s*~~[\s\S]{0,80}?r\$\s*([\d\.,]+)",
-        r"(?i)[❌🔴]\s*r\$\s*([\d\.,]+)[\s\S]{0,80}?[✅🟢🔥]\s*r\$\s*([\d\.,]+)",
-    ]
-
-    melhor = None
-    for padrao in padroes:
-        for match in re.finditer(padrao, texto):
-            preco_de = parse_numero_br(match.group(1))
-            preco_por = parse_numero_br(match.group(2))
-            if not preco_de or not preco_por or preco_por >= preco_de:
-                continue
-
-            pos_por = match.start(2)
-            fim_por = match.end(2)
-            antes_por = texto[max(0, pos_por - 25):pos_por]
-            depois_por = texto[fim_por:min(len(texto), fim_por + 25)]
-            if _eh_contexto_ignorado(antes_por, depois_por):
-                continue
-
-            pct = ((preco_de - preco_por) / preco_de) * 100.0
-            if pct >= desconto_minimo and (melhor is None or pct > melhor[0]):
-                melhor = (pct, preco_de, preco_por)
-
-    return melhor
-
-
-def extrair_cupons(texto):
-    """Extrai códigos de cupom mesmo em quebras de linha ou após 'código:'."""
-    cupons = []
-    vistos = set()
-
-    for match in REGEX_CUPOM.finditer(texto):
-        codigo = match.group(2).strip("`*_\"'.,;:!?-")
-        if len(codigo) < 3:
-            continue
-        chave = codigo.upper()
-        if chave in STOPWORDS_CUPOM or chave in vistos:
-            continue
-        vistos.add(chave)
-        cupons.append(codigo)
-
-    return cupons
-
-
-def formatar_texto_alerta_html(texto_bruto, cupons):
-    """Escapa HTML do post e destaca os cupons encontrados em <code> para cópia com 1 toque."""
-    texto_seguro = html.escape(texto_bruto)
-    for cupom in sorted(cupons, key=len, reverse=True):
-        cupom_escapado = html.escape(cupom)
-        texto_seguro = re.sub(
-            rf"(?<![A-Za-z0-9_-])({re.escape(cupom_escapado)})(?![A-Za-z0-9_-])",
-            r"<code>\1</code>",
-            texto_seguro,
-            flags=re.IGNORECASE,
-        )
-    return texto_seguro
-
-
-def limpar_parametros_url(url):
-    """Remove parâmetros de rastreamento/afiliado mantendo parâmetros funcionais."""
-    try:
-        parsed = urllib.parse.urlparse(url)
-        query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
-        limpos = [(k, v) for k, v in query_items if k.lower() not in PARAMS_TRACKING]
-        nova_query = urllib.parse.urlencode(limpos)
-        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", nova_query, ""))
-    except Exception:
-        return url
-
-
-def limpar_link(url):
-    """Retorna host + path normalizados para chave de deduplicação."""
-    try:
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.netloc.lower().removeprefix("www.")
-        path = parsed.path.rstrip("/")
-        return f"{host}{path}"
-    except Exception:
-        return url
-
-
-def _desembrulhar_query_redirect(url):
-    """Extrai URL de destino quando vem em query params como ?url= ou ?redir=."""
-    atual = url
-    for _ in range(3):
-        parsed = urllib.parse.urlparse(atual)
-        params = urllib.parse.parse_qs(parsed.query)
-        proxima = None
-        for chave in PARAMS_REDIRECT:
-            if chave in params and params[chave]:
-                candidata = params[chave][0].strip()
-                if candidata.startswith(("http://", "https://")):
-                    proxima = candidata
-                    break
-        if not proxima or proxima == atual:
-            break
-        atual = proxima
-    return atual
-
-
-def _extrair_url_de_html(conteudo_html, url_atual):
-    """Busca redirecionamento meta refresh ou link de produto ML em página intermediária."""
-    meta = re.search(
-        r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\'][^"\']*url=([^"\'>\s]+)',
-        conteudo_html,
-        re.IGNORECASE,
-    )
-    if meta:
-        destino = html.unescape(meta.group(1)).strip()
-        return urllib.parse.urljoin(url_atual, destino)
-
-    if "mercadolivre.com" in url_atual.lower():
-        ml_link = re.search(
-            r'https://(?:produto|www)\.mercadolivre\.com\.br/[^\s"\'<>]*MLB-?\d{6,14}[^\s"\'<>]*',
-            conteudo_html,
-            re.IGNORECASE,
-        )
-        if ml_link:
-            return html.unescape(ml_link.group(0))
-
-    return None
-
-
-def _url_bloqueio_ou_login(url):
-    """Evita substituir um link funcional por página de login/captcha após redirect."""
-    lower = url.lower()
-    return any(
-        termo in lower
-        for termo in ("login.", "passport.", "/login", "captcha", "verify", "universal-link", "about:blank")
-    )
-
-
-def expandir_link(url, timeout=4):
-    """Expande encurtadores (Amazon, ML, Shopee, Magalu, Kabum, AliExpress) seguindo redirects."""
-    url_inicial = _desembrulhar_query_redirect(url)
-    host = urllib.parse.urlparse(url_inicial).netloc.lower()
-
-    precisa_expandir = any(dom in host for dom in ENCURTADORES_E_LOJAS) or len(url_inicial) < 45
-    if not precisa_expandir:
-        return url_inicial
-
-    url_final = url_inicial
-    url_atual = url_inicial
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "pt-BR,pt;q=0.9"}
-
-    for metodo in ("HEAD", "GET"):
-        try:
-            req = urllib.request.Request(url_atual, headers=headers, method=metodo)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                candidata = _desembrulhar_query_redirect(resp.geturl())
-                if not _url_bloqueio_ou_login(candidata):
-                    url_final = candidata
-                    url_atual = candidata
-
-                if metodo == "GET":
-                    body = resp.read(65536).decode("utf-8", errors="ignore")
-                    extraida = _extrair_url_de_html(body, url_final)
-                    if extraida and not _url_bloqueio_ou_login(extraida):
-                        url_final = _desembrulhar_query_redirect(extraida)
-                if metodo == "HEAD" and identificar_produto(url_final)["produto_id"]:
-                    break
-                if metodo == "HEAD" and url_final == url_inicial:
-                    continue
-                break
-        except urllib.error.HTTPError as err:
-            try:
-                url_erro = _desembrulhar_query_redirect(err.geturl())
-                if url_erro and not _url_bloqueio_ou_login(url_erro):
-                    url_final = url_erro
-                    url_atual = url_erro
-            except Exception:
-                pass
-            finally:
-                codigo = err.code
-                err.close()
-            if identificar_produto(url_final)["produto_id"]:
-                break
-            if metodo == "HEAD" and codigo in (400, 403, 405, 501):
-                continue
-            break
-        except Exception:
-            if metodo == "HEAD":
-                continue
-            break
-
-    return url_final
-
-
-def _extrair_asin_amazon(url):
-    """Extrai o código ASIN (10 caracteres) de uma URL da Amazon."""
-    match = REGEX_ASIN_AMAZON.search(url)
-    return match.group(1).upper() if match else None
-
-
-def obter_carrinho_amazon(url_real):
-    """Extrai o ASIN de um link Amazon e retorna a URL de adição direta ao carrinho."""
-    asin = _extrair_asin_amazon(url_real)
-    if asin:
-        return f"https://www.amazon.com.br/gp/aws/cart/add.html?ASIN.1={asin}&Quantity.1=1"
-    return None
-
-
-def identificar_produto(url):
-    """Identifica loja, ID único para deduplicação, link limpo e carrinho Amazon."""
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc.lower()
-    path = parsed.path
-    link_limpo = limpar_parametros_url(url)
-    resultado = {"loja": None, "produto_id": None, "link_limpo": link_limpo, "carrinho_amazon": None}
-
-    if "amazon." in host:
-        resultado["loja"] = "Amazon"
-        asin = _extrair_asin_amazon(url)
-        if asin:
-            resultado["produto_id"] = f"amazon:{asin}"
-            resultado["link_limpo"] = f"https://www.amazon.com.br/dp/{asin}"
-            resultado["carrinho_amazon"] = obter_carrinho_amazon(resultado["link_limpo"])
-        return resultado
-
-    if "mercadolivre." in host:
-        resultado["loja"] = "Mercado Livre"
-        match = re.search(r"\b(MLB)-?(\d{6,14})\b", path, re.IGNORECASE) or re.search(
-            r"\b(MLB)-?(\d{6,14})\b", url, re.IGNORECASE
-        )
-        if match:
-            resultado["produto_id"] = f"ml:MLB{match.group(2)}"
-        return resultado
-
-    if "shopee." in host:
-        resultado["loja"] = "Shopee"
-        match = re.search(r"(?:-i\.(\d+)\.(\d+)|/product/(\d+)/(\d+))", url, re.IGNORECASE)
-        if match:
-            shop_id = match.group(1) or match.group(3)
-            item_id = match.group(2) or match.group(4)
-            resultado["produto_id"] = f"shopee:{shop_id}.{item_id}"
-            resultado["link_limpo"] = f"https://shopee.com.br/product/{shop_id}/{item_id}"
-        return resultado
-
-    if "kabum." in host:
-        resultado["loja"] = "Kabum"
-        match = re.search(r"/produto/(\d+)", path, re.IGNORECASE)
-        if match:
-            resultado["produto_id"] = f"kabum:{match.group(1)}"
-        return resultado
-
-    if "magazineluiza." in host or "magalu." in host:
-        resultado["loja"] = "Magalu"
-        match = re.search(r"/p/([a-zA-Z0-9]+)", path, re.IGNORECASE)
-        if match:
-            resultado["produto_id"] = f"magalu:{match.group(1).lower()}"
-        return resultado
-
-    if "aliexpress." in host:
-        resultado["loja"] = "AliExpress"
-        match = re.search(r"/item/(\d+)\.html", path, re.IGNORECASE)
-        if match:
-            item_id = match.group(1)
-            resultado["produto_id"] = f"aliexpress:{item_id}"
-            resultado["link_limpo"] = f"https://pt.aliexpress.com/item/{item_id}.html"
-        return resultado
-
-    return resultado
-
-
-def extrair_links_mensagem(raw_text, entities=None):
-    """Extrai links de entidades TextUrl e do texto bruto preservando a ordem sem duplicar."""
-    links = []
-    vistos = set()
-
-    def adicionar(url):
-        if not url:
-            return
-        url_limpa = url.strip().rstrip(".,;)")
-        if url_limpa.startswith(("http://", "https://")) and url_limpa not in vistos:
-            vistos.add(url_limpa)
-            links.append(url_limpa)
-
-    if entities:
-        for entity in entities:
-            if isinstance(entity, MessageEntityTextUrl):
-                adicionar(entity.url)
-
-    for url in re.findall(r'https?://[^\s<>"\'\)\]]+', raw_text or ""):
-        adicionar(url)
-
-    return links
-
-
-def escolher_link_oferta(links):
-    """Prioriza links de lojas em vez de convites de Telegram/WhatsApp."""
-    dominios_sociais = ("t.me/", "telegram.me/", "wa.me/", "chat.whatsapp.com/")
-    for link in links:
-        lower = link.lower()
-        if not any(soc in lower for soc in dominios_sociais):
-            return link
-    return links[0] if links else None
-
-
-def url_valida_botao(url):
-    """Garante que a URL é válida para uso em Button.url no Telegram."""
-    if not url or " " in url:
-        return False
-    parsed = urllib.parse.urlparse(url)
-    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-
-
-def avaliar_gatilhos(texto_bruto, banco):
-    """Avalia bloqueios negativos, palavras-chave, alvos compostos, tetos simples e desconto real."""
-    for neg in banco.get("negativas", []):
-        if match_padrao(neg, texto_bruto):
-            return False, f"Bloqueio negativo ({neg})"
-
-    for palavra in banco.get("palavras", []):
-        if match_padrao(palavra, texto_bruto):
-            return True, f"Palavra-Chave ({palavra})"
-
-    preco_encontrado = extrair_preco(texto_bruto)
-
-    for alvo in banco.get("alvos_compostos", []):
-        nome = alvo.get("nome", "combo")
-        incluir = alvo.get("incluir", [])
-        excluir = alvo.get("excluir", [])
-        teto = alvo.get("teto")
-
-        if not incluir or not all(match_padrao(termo, texto_bruto) for termo in incluir):
-            continue
-        if any(match_padrao(termo, texto_bruto) for termo in excluir):
-            continue
-        if teto is not None and teto > 0:
-            if preco_encontrado is None or preco_encontrado > float(teto):
-                continue
-            return True, f"Combo ({nome} por R$ {preco_encontrado:.2f})"
-        return True, f"Combo ({nome})"
-
-    if preco_encontrado is not None:
-        for produto, preco_teto in banco.get("alvos_preco", {}).items():
-            if match_padrao(produto, texto_bruto) and preco_encontrado <= float(preco_teto):
-                return True, f"Teto Atingido ({produto} por R$ {preco_encontrado:.2f})"
-
-    desconto_min = float(banco.get("desconto_minimo", 0) or 0)
-    desconto = detectar_desconto_real(texto_bruto, desconto_min)
-    if desconto is not None:
-        pct, preco_de, preco_por = desconto
-        return True, f"Queda Real de {pct:.0f}% (De R$ {preco_de:.2f} por R$ {preco_por:.2f})"
-
-    return False, "Sem gatilho correspondente"
-
-
-def parsear_comando_composto(argumento):
-    """
-    Faz parsing de:
-      nome | incluir1 + incluir2 | excluir1 + excluir2 | valor
-    ou (sem exclusões):
-      nome | incluir1 + incluir2 | valor
-    """
-    partes = [p.strip() for p in argumento.split("|")]
-    if len(partes) not in (3, 4):
-        raise ValueError("Formato inválido")
-
-    nome = partes[0].lower()
-    incluir = [x.strip() for x in re.split(r"[+,]", partes[1]) if x.strip()]
-    if not nome or not incluir:
-        raise ValueError("Nome ou termos obrigatórios vazios")
-
-    if len(partes) == 4:
-        excluir = [x.strip() for x in re.split(r"[+,]", partes[2]) if x.strip()]
-        teto_str = partes[3]
-    else:
-        excluir = []
-        teto_str = partes[2]
-
-    teto = parse_numero_br(re.sub(r"(?i)r\$", "", teto_str).strip())
-    if teto is None:
-        raise ValueError("Valor numérico inválido")
-
-    for termo in incluir + excluir:
-        valida, erro = regex_valida(termo)
-        if not valida:
-            raise ValueError(f"Regex inválida em '{termo}': {erro}")
-
-    return {"nome": nome, "incluir": incluir, "excluir": excluir, "teto": teto}
-
-
-def montar_chave_duplicata(info_produto, link_referencia, motivo, texto_bruto):
-    """Define a chave única de deduplicação priorizando o ID real do produto."""
-    if info_produto and info_produto.get("produto_id"):
-        return info_produto["produto_id"]
-    if link_referencia:
-        return limpar_link(link_referencia)
-    if "Teto Atingido" in motivo or "Combo" in motivo:
-        return motivo
-    return (texto_bruto or "")[:60].strip().lower()
-
-
-def montar_mensagem_e_botoes(
-    nome_grupo,
-    motivo_disparo,
-    texto_bruto,
-    cupons,
-    info_produto,
-    link_oferta,
-    link_origem,
-    links_extras=None,
-    texto_recuperado=None,
-):
-    """Monta a mensagem HTML (com cupom no topo) e botões grandes Button.url."""
-    linhas = ["🚨 <b>ALERTA DE PROMOÇÃO!</b> 🚨"]
-
-    if cupons:
-        cupons_html = " ".join(f"<code>{html.escape(c)}</code>" for c in cupons)
-        linhas.append(f"🎟️ <b>Cupom(ns):</b> {cupons_html}")
-
-    linhas.append(f"📢 <b>Grupo:</b> {html.escape(nome_grupo)}")
-    if info_produto and info_produto.get("loja"):
-        linhas.append(f"🏪 <b>Loja:</b> {html.escape(info_produto['loja'])}")
-    linhas.append(f"🎯 <i>Motivo: {html.escape(motivo_disparo)}</i>")
-    linhas.append("")
-    linhas.append(formatar_texto_alerta_html(texto_bruto, cupons))
-
-    if texto_recuperado:
-        linhas.append("")
-        linhas.append("🕰️ <b>[RECUPERADO DA MENSAGEM ANTERIOR]:</b>")
-        linhas.append(formatar_texto_alerta_html(texto_recuperado, cupons))
-
-    links_visiveis = []
-    for lk in [link_oferta] + list(links_extras or []):
-        if lk and lk not in links_visiveis:
-            links_visiveis.append(lk)
-
-    if links_visiveis:
-        linhas.append("")
-        linhas.append("🔗 <b>Link(s):</b>")
-        for lk in links_visiveis[:5]:
-            linhas.append(html.escape(lk))
-
-    mensagem = "\n".join(linhas)
-    if len(mensagem) > 4000:
-        mensagem = mensagem[:3990] + "\n..."
-
-    botoes = []
-    if url_valida_botao(link_oferta):
-        botoes.append([Button.url("🔥 Abrir Oferta", link_oferta)])
-    if info_produto and url_valida_botao(info_produto.get("carrinho_amazon")):
-        botoes.append([Button.url("🛒 Carrinho Amazon", info_produto["carrinho_amazon"])])
-    if url_valida_botao(link_origem):
-        botoes.append([Button.url("📢 Ver Post Original", link_origem)])
-
-    return mensagem, (botoes or None)
-
-
-def disparar_macrodroid(url_macrodroid, link_oferta, timeout=5):
-    """Envia POST síncrono ao MacroDroid (chamado via asyncio.to_thread)."""
-    req = urllib.request.Request(
-        url_macrodroid,
-        data=link_oferta.encode("utf-8"),
-        headers={"User-Agent": USER_AGENT},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status
-
-
-async def enviar_em_partes(event, texto, parse_mode="html"):
+    linhas = []
+    for linha in botoes_spec:
+        botoes_linha = []
+        for item in linha:
+            tipo, texto = item[0], item[1]
+            if tipo == "url":
+                botoes_linha.append(Button.url(texto, item[2]))
+            elif tipo == "inline":
+                botoes_linha.append(Button.inline(texto, item[2].encode("utf-8")))
+            elif tipo == "text":
+                botoes_linha.append(Button.text(texto, resize=True, single_use=False))
+        if botoes_linha:
+            linhas.append(botoes_linha)
+    return linhas or None
+
+
+async def enviar_em_partes_fn(send_fn, texto, parse_mode="html"):
     """Envia mensagens longas dividindo por linhas para respeitar o limite do Telegram."""
     if len(texto) <= 4000:
-        await event.reply(texto, parse_mode=parse_mode)
+        await send_fn(texto, parse_mode=parse_mode)
         return
 
     bloco = ""
     for linha in texto.splitlines(keepends=True):
         if len(bloco) + len(linha) > 3900:
-            await event.reply(bloco, parse_mode=parse_mode)
+            await send_fn(bloco, parse_mode=parse_mode)
             bloco = ""
         bloco += linha
     if bloco:
-        await event.reply(bloco, parse_mode=parse_mode)
+        await send_fn(bloco, parse_mode=parse_mode)
 
 
-def _gerenciar_lista_regex(banco, chave, adicionar, argumento, nome_singular):
-    """Adiciona ou remove expressões em 'palavras' ou 'negativas' com validação de regex."""
-    if adicionar:
-        valida, erro = regex_valida(argumento)
-        if not valida:
-            return f"⚠️ Expressão inválida: <code>{html.escape(erro)}</code>"
-        if argumento in banco[chave]:
-            return f"ℹ️ {nome_singular} já existe na lista."
-        banco[chave].append(argumento)
-        salvar_dados(banco)
-        return f"✅ <code>{html.escape(argumento)}</code> adicionada!"
+def _formatar_texto_ajuda():
+    return (
+        "🤖 <b>Comandos e Atalhos Rápidos</b>\n\n"
+        "<b>Painel Visual (1 toque):</b>\n"
+        "• <code>/menu</code> (<code>/m</code>) — Painel principal com botões\n"
+        "• <code>/prioridade</code> (<code>/prio</code>) — Editar o que dispara MacroDroid/som vs silencioso\n\n"
+        "<b>Consultas e Controle:</b>\n"
+        "• <code>/lista</code> (<code>/l</code>) — Listas numeradas (para remover pelo número)\n"
+        "• <code>/status</code> (<code>/s</code>) — Estatísticas e estado\n"
+        "• <code>/pausar</code> (<code>/p</code> alterna) | <code>/retomar</code> (<code>/r</code>)\n"
+        "• <code>/teste</code> (<code>/t</code>) | <code>/ultimos</code> (<code>/u</code>) | <code>/logs [30]</code>\n"
+        "• <code>/backup</code> (<code>/b</code>) — Baixar JSON (envie um <code>.json</code> para restaurar)\n\n"
+        "<b>Edição Rápida (aceita lote com <code>;</code> e remoção por nº):</b>\n"
+        "• <code>/ac @c1 @c2</code> | <code>/dc 1</code> (canais)\n"
+        "• <code>/ap termo1; termo2</code> | <code>/dp 1, 3</code> (palavras)\n"
+        "• <code>/ab termo</code> | <code>/db 1</code> (bloqueios)\n"
+        "• <code>/at item, 400-1300</code> | <code>/dt 1</code> (tetos simples)\n"
+        "• <code>/ax nome | ter1 + ter2 | ex1, ex2 | 120-220</code> | <code>/dx 1</code> (combos)\n"
+        "• <code>/sd 65, 75</code> (ou <code>/prio queda 65 75</code>)\n"
+        "• <code>/dnd 0-7</code> (ou <code>off</code>) | <code>/filtro usados on|off</code> | <code>/res 21</code>"
+    )
 
-    if argumento not in banco[chave]:
-        return f"⚠️ {nome_singular} não encontrada."
-    banco[chave].remove(argumento)
-    salvar_dados(banco)
-    return f"🗑️ <code>{html.escape(argumento)}</code> removida!"
+
+def _formatar_texto_status(banco, cfg, estado_runtime, estado_persistente):
+    uptime_min = int((time.time() - estado_runtime["inicio"]) // 60)
+    stats = garantir_stats_do_dia(estado_persistente)
+    dnd = banco.get("nao_perturbe", {})
+    filtros = banco.get("filtros_extras", {})
+    prio = banco.get("prioridades", {})
+    dnd_txt = f"{dnd.get('inicio', 0):02d}h-{dnd.get('fim', 7):02d}h" if dnd.get("ativo") else "OFF"
+    usados_txt = "ON" if filtros.get("bloquear_usados") else "OFF"
+    import_txt = "ON" if filtros.get("bloquear_importacao") else "OFF"
+    estado_txt = "⏸️ Pausado" if estado_runtime["pausado"] else "✅ Ativo"
+    macro_txt = "Ativo" if cfg["URL_MACRODROID"] else "Desativado"
+    desc_crit = float(banco.get("desconto_critico", 75) or 75)
+    crit_txt = "OFF" if desc_crit >= 100 else f"≥{desc_crit:.0f}%"
+    return (
+        f"📊 <b>Status do Caçador</b>\n"
+        f"• Estado: {estado_txt} ({uptime_min} min online)\n"
+        f"• Hoje: {stats['mensagens_lidas']} msgs lidas | {stats['alertas_enviados']} alertas | {stats['duplicatas_barradas']} duplicatas\n"
+        f"• Prioridades Altas: Teto={prio.get('teto', 'alta').upper()} | Combo={prio.get('combo', 'alta').upper()} | Queda={crit_txt}\n"
+        f"• DND madrugada: {dnd_txt}\n"
+        f"• Filtros: Usados={usados_txt} | Import={import_txt}\n"
+        f"• Canais: {len(banco['canais'])} | MacroDroid: {macro_txt}"
+    )
 
 
-def _formatar_lista_painel(banco, estado):
-    """Monta a resposta do comando /lista."""
-    txt_canais = "\n".join(html.escape(c) for c in banco["canais"]) or "Nenhum"
-    txt_palavras = "\n".join(html.escape(p) for p in banco["palavras"]) or "Nenhuma"
-    txt_negativas = "\n".join(html.escape(n) for n in banco["negativas"]) or "Nenhuma"
+def _formatar_lista_painel(banco, estado_runtime):
+    """Monta /lista com itens numerados e ícones de prioridade."""
+    txt_canais = "\n".join(f"{i}. <code>{html.escape(c)}</code>" for i, c in enumerate(banco["canais"], 1)) or "Nenhum"
+    txt_palavras = "\n".join(
+        f"{i}. {'🔴' if palavra_eh_alta(banco, p) else '🟡'} <code>{html.escape(p)}</code>"
+        for i, p in enumerate(banco["palavras"], 1)
+    ) or "Nenhuma"
+    txt_negativas = "\n".join(f"{i}. <code>{html.escape(n)}</code>" for i, n in enumerate(banco["negativas"], 1)) or "Nenhuma"
 
     if banco.get("alvos_preco"):
-        txt_tetos = "\n".join(
-            f"🎯 <b>{html.escape(k)}</b>: até R$ {v:.2f}"
-            for k, v in banco["alvos_preco"].items()
-        )
+        linhas_tetos = []
+        for i, (k, val) in enumerate(banco["alvos_preco"].items(), 1):
+            min_p, max_p = normalizar_faixa_preco(val)
+            linhas_tetos.append(f"{i}. 🎯 <b>{html.escape(k)}</b>: {formatar_faixa_preco(min_p, max_p)}")
+        txt_tetos = "\n".join(linhas_tetos)
     else:
         txt_tetos = "Nenhum limite simples configurado."
 
     if banco.get("alvos_compostos"):
         linhas_comp = []
-        for c in banco["alvos_compostos"]:
+        for i, c in enumerate(banco["alvos_compostos"], 1):
             inc = " + ".join(c["incluir"])
             exc = f" | sem: {', '.join(c['excluir'])}" if c.get("excluir") else ""
-            teto_txt = f"≤ R$ {float(c['teto']):.2f}" if c.get("teto") else "sem teto"
+            faixa = formatar_faixa_preco(c.get("teto_min", 0), c["teto"]) if c.get("teto") else "sem teto"
             linhas_comp.append(
-                f"🧩 <b>{html.escape(c['nome'])}</b>: [{html.escape(inc)}{html.escape(exc)}] ({teto_txt})"
+                f"{i}. 🧩 <b>{html.escape(c['nome'])}</b>: [{html.escape(inc)}{html.escape(exc)}] ({faixa})"
             )
         txt_compostos = "\n".join(linhas_comp)
     else:
         txt_compostos = "Nenhum alvo composto configurado."
 
     desc = float(banco.get("desconto_minimo", 0) or 0)
-    txt_desc = f"{desc:.0f}%" if desc > 0 else "Desativado"
-    status_txt = "⏸️ Pausado" if estado["pausado"] else "✅ Ativo"
+    desc_crit = float(banco.get("desconto_critico", 75) or 75)
+    crit_txt = "OFF" if desc_crit >= 100 else f"≥ {desc_crit:.0f}%"
+    txt_desc = f"Normal ≥ {desc:.0f}% | Alta {crit_txt}" if desc > 0 else "Desativado"
+
+    prio = banco.get("prioridades", {})
+    dnd = banco.get("nao_perturbe", {})
+    txt_dnd = f"{dnd.get('inicio', 0):02d}h-{dnd.get('fim', 7):02d}h" if dnd.get("ativo") else "Desativado"
+
+    filtros = banco.get("filtros_extras", {})
+    txt_usados = "ON" if filtros.get("bloquear_usados") else "OFF"
+    txt_import = "ON" if filtros.get("bloquear_importacao") else "OFF"
+
+    resumo_h = banco.get("resumo_hora")
+    txt_resumo = f"{int(resumo_h):02d}:00" if resumo_h is not None and int(resumo_h) >= 0 else "OFF"
+    status_txt = "⏸️ Pausado" if estado_runtime["pausado"] else "✅ Ativo"
 
     return (
-        f"⚙️ <b>Status:</b> {status_txt} | <b>Desconto Auto:</b> {txt_desc}\n\n"
-        f"📡 <b>Canais e Grupos ({len(banco['canais'])}):</b>\n{txt_canais}\n\n"
-        f"🔑 <b>Palavras-Chave ({len(banco['palavras'])}):</b>\n{txt_palavras}\n\n"
+        f"⚙️ <b>Status:</b> {status_txt} | <b>DND:</b> {txt_dnd} | <b>Resumo:</b> {txt_resumo}\n"
+        f"⚡ <b>Prioridades:</b> Teto={prio.get('teto', 'alta').upper()} | Combo={prio.get('combo', 'alta').upper()} | Queda: {txt_desc}\n"
+        f"🧹 <b>Filtros:</b> Usados={txt_usados} | Importação={txt_import}\n\n"
+        f"📡 <b>Canais ({len(banco['canais'])}):</b>\n{txt_canais}\n\n"
+        f"🔑 <b>Palavras-Chave ({len(banco['palavras'])}) [🔴Alta / 🟡Normal]:</b>\n{txt_palavras}\n\n"
         f"📉 <b>Tetos Simples ({len(banco['alvos_preco'])}):</b>\n{txt_tetos}\n\n"
         f"🧩 <b>Tetos Compostos ({len(banco['alvos_compostos'])}):</b>\n{txt_compostos}\n\n"
-        f"⛔ <b>Bloqueios ({len(banco['negativas'])}):</b>\n{txt_negativas}"
+        f"⛔ <b>Bloqueios ({len(banco['negativas'])}):</b>\n{txt_negativas}\n\n"
+        f"💡 <i>Use /dc, /dp, /db, /dt ou /dx + número para remover rápido.</i>"
     )
 
 
-async def processar_comando_painel(event, banco, cfg, estado):
-    """Processa comandos administrativos enviados no chat do bot."""
-    cmd_full = (event.raw_text or "").strip()
-    if not cmd_full.startswith("/"):
+def _normalizar_canal(item):
+    novo = item.lower().strip()
+    if novo and not novo.startswith("@") and not novo.lstrip("-").isdigit():
+        novo = f"@{novo}"
+    return novo
+
+
+def _adicionar_regex_lote(banco, chave, argumento, caminho_json=ARQUIVO_JSON):
+    """Adiciona uma ou várias expressões (separadas por ';' ou quebra de linha) com validação."""
+    itens = [x.strip() for x in re.split(r"[;\n]+", argumento) if x.strip()]
+    adicionados, ja_existiam, invalidos = [], [], []
+    for item in itens:
+        valida, erro = regex_valida(item)
+        if not valida:
+            invalidos.append(f"{item} ({erro})")
+            continue
+        if item in banco[chave]:
+            ja_existiam.append(item)
+            continue
+        banco[chave].append(item)
+        adicionados.append(item)
+
+    if adicionados:
+        salvar_dados(banco, caminho_json)
+
+    partes = []
+    if adicionados:
+        partes.append(f"✅ Adicionado(s): {', '.join(f'<code>{html.escape(x)}</code>' for x in adicionados)}")
+        if chave == "palavras":
+            partes.append("<i>(Entraram como 🟡 NORMAL; use /prio para promover para 🔴 ALTA)</i>")
+    if ja_existiam:
+        partes.append(f"ℹ️ Já existia(m): {', '.join(f'<code>{html.escape(x)}</code>' for x in ja_existiam)}")
+    if invalidos:
+        partes.append(f"⚠️ Inválida(s): {', '.join(html.escape(x) for x in invalidos)}")
+    if not partes:
+        return False, "⚠️ Nenhum termo válido informado."
+    return len(invalidos) == 0, "\n".join(partes)
+
+
+def _executar_add_canal(banco, argumento, caminho_json=ARQUIVO_JSON):
+    itens = [_normalizar_canal(x) for x in re.split(r"[\s,;]+", argumento) if x.strip()]
+    if not itens:
+        return False, "⚠️ Informe ao menos um canal (ex.: <code>@ofertasbr</code>)."
+    adicionados, existentes = [], []
+    existentes_lower = {c.lower() for c in banco["canais"]}
+    for novo in itens:
+        if novo not in existentes_lower:
+            banco["canais"].append(novo)
+            existentes_lower.add(novo)
+            adicionados.append(novo)
+        else:
+            existentes.append(novo)
+    if adicionados:
+        salvar_dados(banco, caminho_json)
+    msgs = []
+    if adicionados:
+        msgs.append(f"✅ Adicionado(s): {', '.join(f'<code>{html.escape(c)}</code>' for c in adicionados)}")
+    if existentes:
+        msgs.append(f"ℹ️ Já existia(m): {', '.join(f'<code>{html.escape(c)}</code>' for c in existentes)}")
+    return True, "\n".join(msgs)
+
+
+def _executar_add_teto(banco, argumento, caminho_json=ARQUIVO_JSON):
+    try:
+        produto, faixa_str = [x.strip() for x in argumento.split(",", 1)]
+        valida, erro = regex_valida(produto)
+        if not valida:
+            return False, f"⚠️ Padrão inválido: <code>{html.escape(erro)}</code>"
+        min_p, max_p = parsear_faixa_preco(faixa_str)
+        banco["alvos_preco"][produto.lower()] = {"min": min_p, "max": max_p} if min_p > 0 else max_p
+        salvar_dados(banco, caminho_json)
+        return (
+            True,
+            f"🎯 <b>Teto adicionado!</b> Disparo para <b>{html.escape(produto)}</b> ({formatar_faixa_preco(min_p, max_p)})",
+        )
+    except Exception:
+        return (
+            False,
+            "⚠️ <b>Formato incorreto!</b>\nUse: <code>placa de vídeo, 400-1300</code> ou <code>ssd, 300</code>",
+        )
+
+
+def _executar_add_combo(banco, argumento, caminho_json=ARQUIVO_JSON):
+    try:
+        composto = parsear_comando_composto(argumento)
+        banco["alvos_compostos"] = [
+            c for c in banco["alvos_compostos"] if c.get("nome") != composto["nome"]
+        ]
+        banco["alvos_compostos"].append(composto)
+        salvar_dados(banco, caminho_json)
+        exc_txt = ", ".join(composto["excluir"]) if composto["excluir"] else "nenhuma"
+        return (
+            True,
+            f"🧩 <b>Alvo composto salvo!</b>\n"
+            f"• Nome: <b>{html.escape(composto['nome'])}</b>\n"
+            f"• Exige: <code>{html.escape(' + '.join(composto['incluir']))}</code>\n"
+            f"• Exclui: <code>{html.escape(exc_txt)}</code>\n"
+            f"• Faixa: <b>{formatar_faixa_preco(composto['teto_min'], composto['teto'])}</b>",
+        )
+    except Exception as err:
+        return (
+            False,
+            f"⚠️ <b>Formato incorreto</b> ({html.escape(str(err))}).\n"
+            "Use: <code>ram16 | 16gb + ddr4 | notebook, sodimm | 120-220</code>",
+        )
+
+
+async def _executar_teste_sistema(send_fn, cfg):
+    """Envia alerta simulado com botões e testa o disparo do MacroDroid."""
+    info_demo = identificar_produto("https://www.amazon.com.br/dp/B09V3KXJPB")
+    url_comp = gerar_url_comparacao(info_demo, "SSD NVMe 1TB Teste", info_demo["link_limpo"])
+    msg, _, spec = montar_mensagem_e_botoes_spec(
+        nome_grupo="Teste do Sistema",
+        motivo_disparo="Teste Manual (/teste)",
+        prioridade="alta",
+        texto_bruto="SSD NVMe 1TB Teste — Cupom: TESTE20\nDe R$ 600,00 por R$ 149,90",
+        cupons=["TESTE20"],
+        info_produto=info_demo,
+        link_oferta=info_demo["link_limpo"],
+        link_origem="https://t.me/Telegram",
+        url_comparacao=url_comp,
+        chave_silenciar=hash_curto_chave("teste:demo"),
+    )
+    await send_fn(msg, parse_mode="html", link_preview=False, buttons=converter_botoes_telethon(spec))
+
+    if not cfg["URL_MACRODROID"]:
+        await send_fn("ℹ️ MacroDroid está desativado (<code>URL_MACRODROID</code> vazio no <code>.env</code>).", parse_mode="html")
         return
 
+    try:
+        status_http = await asyncio.to_thread(disparar_macrodroid, cfg["URL_MACRODROID"], "https://www.amazon.com.br")
+        await send_fn(f"✅ MacroDroid respondeu com sucesso (HTTP <code>{status_http}</code>).", parse_mode="html")
+    except Exception as err:
+        await send_fn(f"⚠️ Falha ao testar MacroDroid: <code>{html.escape(str(err))}</code>", parse_mode="html")
+
+
+async def processar_backup_recebido(event, banco, caminho_json=ARQUIVO_JSON):
+    """Restaura um arquivo banco_de_dados.json enviado pelo usuário no chat do bot."""
+    if not event.document:
+        return False
+    nome_arq = getattr(event.file, "name", "") or ""
+    if not nome_arq.lower().endswith(".json"):
+        return False
+
+    try:
+        dados_bytes = await event.download_media(file=bytes)
+        novo_banco = json.loads(dados_bytes.decode("utf-8"))
+        if not isinstance(novo_banco, dict):
+            raise ValueError("JSON raiz deve ser um objeto")
+        for obrigatoria in ("canais", "palavras", "negativas"):
+            if obrigatoria not in novo_banco or not isinstance(novo_banco[obrigatoria], list):
+                raise ValueError(f"Chave obrigatória '{obrigatoria}' ausente ou inválida")
+
+        if os.path.exists(caminho_json):
+            with open(caminho_json, "r", encoding="utf-8") as orig, open(f"{caminho_json}.bak", "w", encoding="utf-8") as bak:
+                bak.write(orig.read())
+
+        novo_banco, _ = migrar_estrutura_dados(novo_banco)
+        salvar_dados(novo_banco, caminho_json)
+        banco.clear()
+        banco.update(novo_banco)
+
+        await event.reply(
+            f"✅ <b>Backup restaurado com sucesso!</b>\n"
+            f"• Canais: {len(banco['canais'])}\n"
+            f"• Palavras: {len(banco['palavras'])}\n"
+            f"• Tetos simples: {len(banco['alvos_preco'])}\n"
+            f"• Tetos compostos: {len(banco['alvos_compostos'])}",
+            parse_mode="html",
+        )
+        logger.info("Backup restaurado via Telegram (%d canais).", len(banco["canais"]))
+    except Exception as err:
+        await event.reply(f"⚠️ Falha ao restaurar JSON: <code>{html.escape(str(err))}</code>", parse_mode="html")
+    return True
+
+
+def _aplicar_setdesconto(banco, min_val, crit_val=None, caminho_json=ARQUIVO_JSON):
+    """Atualiza faixas de desconto mínimo e crítico validando limites."""
+    if min_val < 0 or min_val >= 100:
+        raise ValueError("Desconto mínimo deve ser entre 0 e 99")
+    banco["desconto_minimo"] = float(min_val)
+    if crit_val is not None:
+        if crit_val < 0 or crit_val > 100:
+            raise ValueError("Desconto crítico deve ser entre 0 e 100")
+        banco["desconto_critico"] = 100.0 if crit_val == 0 else max(float(min_val), float(crit_val))
+    elif float(banco.get("desconto_critico", 75) or 75) < float(min_val):
+        banco["desconto_critico"] = float(min_val)
+    salvar_dados(banco, caminho_json)
+
+
+def _resolver_alvo_palavra(banco, token):
+    """Localiza palavra por índice 1-based ou por texto exato."""
+    palavras = banco.get("palavras", [])
+    if token.isdigit():
+        idx = int(token)
+        if 1 <= idx <= len(palavras):
+            return palavras[idx - 1]
+        return None
+    if token in palavras:
+        return token
+    return next((p for p in palavras if p.lower() == token.lower()), None)
+
+
+async def _processar_prioridade_texto(event, banco, argumento, caminho_json=ARQUIVO_JSON):
+    """Gerencia /prioridade (/prio) via texto ou abre o painel inline."""
+    if not argumento:
+        texto, spec = montar_painel_prioridades_spec(banco)
+        await event.reply(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+        return
+
+    tokens = argumento.split()
+    sub = tokens[0].lower()
+    prio = banco.setdefault("prioridades", {"teto": "alta", "combo": "alta", "palavras_altas": []})
+
+    if sub in ("teto", "combo"):
+        if len(tokens) == 1:
+            atual = prio.get(sub, "alta")
+            novo = "normal" if atual == "alta" else "alta"
+        elif tokens[1].lower() in ("alta", "normal"):
+            novo = tokens[1].lower()
+        else:
+            await event.reply(f"⚠️ Use <code>/prio {sub} alta</code> ou <code>/prio {sub} normal</code>.", parse_mode="html")
+            return
+        prio[sub] = novo
+        salvar_dados(banco, caminho_json)
+        icone = "🔴 ALTA (MacroDroid)" if novo == "alta" else "🟡 NORMAL (Silenciosa)"
+        await event.reply(f"⚡ Prioridade de <b>{sub.capitalize()}</b> alterada para {icone}.", parse_mode="html")
+
+    elif sub == "queda":
+        try:
+            if len(tokens) < 2:
+                raise ValueError("Faltam valores")
+            min_v = float(tokens[1].replace("%", "").replace(",", "."))
+            crit_v = None
+            if len(tokens) >= 3:
+                crit_raw = tokens[2].lower()
+                crit_v = 100.0 if crit_raw in ("off", "0", "desativar") else float(crit_raw.replace("%", "").replace(",", "."))
+            _aplicar_setdesconto(banco, min_v, crit_v, caminho_json)
+            crit_txt = "OFF (só silenc.)" if banco["desconto_critico"] >= 100 else f"≥ {banco['desconto_critico']:.0f}%"
+            await event.reply(
+                f"📉 Quedas atualizadas: Normal ≥ <b>{banco['desconto_minimo']:.0f}%</b> | Alta <b>{crit_txt}</b>.",
+                parse_mode="html",
+            )
+        except Exception:
+            await event.reply("⚠️ Use <code>/prio queda 65 75</code> (ou <code>/prio queda 65 off</code>).", parse_mode="html")
+
+    elif sub in ("palavra", "p"):
+        if len(tokens) < 2:
+            texto, spec = montar_painel_palavras_prio_spec(banco, 0)
+            await event.reply(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            return
+        nivel = None
+        if len(tokens) >= 3 and tokens[-1].lower() in ("alta", "normal"):
+            nivel = tokens[-1].lower()
+            alvo_str = " ".join(tokens[1:-1])
+        else:
+            alvo_str = " ".join(tokens[1:])
+        palavra = _resolver_alvo_palavra(banco, alvo_str)
+        if not palavra:
+            await event.reply("⚠️ Palavra não encontrada (use o número de <code>/lista</code> ou o texto exato).", parse_mode="html")
+            return
+        novo = alternar_prioridade_palavra(banco, palavra, nivel)
+        salvar_dados(banco, caminho_json)
+        icone = "🔴 ALTA" if novo == "alta" else "🟡 NORMAL"
+        await event.reply(f"🔑 <code>{html.escape(palavra)}</code> agora é {icone}.", parse_mode="html")
+
+    else:
+        await event.reply(
+            "⚠️ Subcomando inválido.\n"
+            "• <code>/prio</code> (abre botões)\n"
+            "• <code>/prio teto alta|normal</code>\n"
+            "• <code>/prio combo alta|normal</code>\n"
+            "• <code>/prio queda 65 75</code>\n"
+            "• <code>/prio palavra 3 alta|normal</code>",
+            parse_mode="html",
+        )
+
+
+async def _enviar_ultimos(send_fn, estado_persistente):
+    ultimos = list(reversed(estado_persistente.get("ultimos", [])[-10:]))
+    if not ultimos:
+        await send_fn("📭 Nenhum alerta registrado ainda.")
+        return
+    linhas = ["🕘 <b>Últimos Alertas Enviados</b>\n"]
+    for i, item in enumerate(ultimos, 1):
+        linhas.append(
+            f"{i}. <b>{html.escape(item.get('hora', '--:--'))}</b> "
+            f"[{html.escape(item.get('loja') or 'Link')}] "
+            f"<i>{html.escape(item.get('motivo', ''))}</i>\n"
+            f"   {html.escape(item.get('link') or '')}"
+        )
+    await enviar_em_partes_fn(send_fn, "\n".join(linhas), parse_mode="html")
+
+
+async def _enviar_logs(send_fn, qtd=30, caminho_log=ARQUIVO_LOG):
+    linhas = ler_ultimas_linhas_log(qtd, caminho_log=caminho_log)
+    if not linhas:
+        await send_fn("📄 Arquivo de log ainda está vazio.")
+        return
+    conteudo = html.escape("\n".join(linhas))
+    if len(conteudo) > 3900:
+        conteudo = conteudo[-3900:]
+    await send_fn(f"📄 <b>Últimas {len(linhas)} linhas do log:</b>\n<pre>{conteudo}</pre>", parse_mode="html")
+
+
+async def _enviar_backup(send_fn, bot_client, chat_id, caminho_json=ARQUIVO_JSON):
+    if bot_client and os.path.exists(caminho_json):
+        await bot_client.send_file(
+            chat_id,
+            caminho_json,
+            caption="💾 Backup atual do banco_de_dados.json (envie um .json aqui para restaurar).",
+        )
+    else:
+        await send_fn("⚠️ Banco ainda não foi gravado em disco ou cliente indisponível.")
+
+
+async def _responder_wizard_add(event, estado_runtime, banco, tipo_acao, texto, caminho_json=ARQUIVO_JSON):
+    """Processa texto digitado pelo usuário durante o fluxo interativo ➕ Adicionar."""
+    if tipo_acao == "add:palavra":
+        ok, msg = _adicionar_regex_lote(banco, "palavras", texto, caminho_json)
+    elif tipo_acao == "add:bloqueio":
+        ok, msg = _adicionar_regex_lote(banco, "negativas", texto, caminho_json)
+    elif tipo_acao == "add:canal":
+        ok, msg = _executar_add_canal(banco, texto, caminho_json)
+    elif tipo_acao == "add:teto":
+        ok, msg = _executar_add_teto(banco, texto, caminho_json)
+    elif tipo_acao == "add:combo":
+        ok, msg = _executar_add_combo(banco, texto, caminho_json)
+    else:
+        estado_runtime["aguardando"] = None
+        return
+
+    if ok:
+        estado_runtime["aguardando"] = None
+        await event.reply(msg, parse_mode="html")
+    else:
+        await event.reply(
+            f"{msg}\n\n<i>Tente novamente ou toque em ❌ Cancelar:</i>",
+            parse_mode="html",
+            buttons=converter_botoes_telethon([[("inline", "❌ Cancelar", "wiz:cancel")]]),
+        )
+
+
+async def processar_comando_painel(
+    event,
+    banco,
+    cfg,
+    estado_runtime,
+    estado_persistente,
+    bot_client=None,
+    caminho_json=ARQUIVO_JSON,
+    caminho_log=ARQUIVO_LOG,
+):
+    """Processa teclado fixo, fluxos interativos, comandos e atalhos no chat do bot."""
+    cmd_full = (event.raw_text or "").strip()
+    if not cmd_full:
+        return
+
+    # 1. Botões do teclado fixo inferior têm prioridade e nunca viram texto de cadastro
+    if cmd_full in TEXTOS_TECLADO_FIXO:
+        estado_runtime["aguardando"] = None
+        if cmd_full == "➕ Adicionar":
+            titulo, spec = montar_wizard_categoria_spec("add")
+            await event.reply(titulo, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            return
+        if cmd_full == "➖ Remover":
+            titulo, spec = montar_wizard_categoria_spec("rem")
+            await event.reply(titulo, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            return
+        if cmd_full == "📋 Minhas listas":
+            cmd_full = "/lista"
+        elif cmd_full == "🎛️ Painel":
+            cmd_full = "/menu"
+        elif cmd_full == "⚡ Prioridades":
+            cmd_full = "/prioridade"
+        elif cmd_full == "🕘 Histórico":
+            cmd_full = "/ultimos"
+
+    # 2. Mensagem de texto livre durante wizard ativo
+    if not cmd_full.startswith("/"):
+        acao_pendente = estado_runtime.get("aguardando")
+        if acao_pendente:
+            await _responder_wizard_add(event, estado_runtime, banco, acao_pendente, cmd_full, caminho_json)
+        return
+
+    estado_runtime["aguardando"] = None
     partes = cmd_full.split(" ", 1)
-    comando = partes[0].lower()
+    cmd_original = partes[0].lower()
+    comando = ALIASES_COMANDO.get(cmd_original, cmd_original)
     argumento = partes[1].strip() if len(partes) > 1 else ""
     logger.info("Comando recebido no painel: %s", cmd_full)
 
-    if comando == "/ajuda":
-        msg = (
-            "🤖 <b>Comandos Disponíveis</b>\n\n"
-            "• <code>/lista</code> — Exibe canais, palavras, bloqueios, tetos e desconto\n"
-            "• <code>/addcanal @canal</code> | <code>/delcanal @canal</code>\n"
-            "• <code>/addpalavra termo</code> | <code>/delpalavra termo</code>\n"
-            "• <code>/addbloqueio termo</code> | <code>/delbloqueio termo</code>\n"
-            "• <code>/addteto item, valor</code> | <code>/delteto item</code>\n"
-            "• <code>/addcomposto nome | ter1 + ter2 | ex1, ex2 | valor</code>\n"
-            "• <code>/delcomposto nome</code>\n"
-            "• <code>/setdesconto 65</code> (0 desativa detecção automática de %)\n"
-            "• <code>/status</code> | <code>/pausar</code> | <code>/retomar</code>\n"
-            "• <code>/getid</code> (envie no grupo alvo com sua conta)"
-        )
-        await event.reply(msg, parse_mode="html")
-    elif comando == "/lista":
-        await enviar_em_partes(event, _formatar_lista_painel(banco, estado), parse_mode="html")
-    elif comando == "/status":
-        uptime_min = int((time.time() - estado["inicio"]) // 60)
-        status_txt = "⏸️ Pausado" if estado["pausado"] else "✅ Ativo"
+    if comando == "/start":
         await event.reply(
-            f"📊 <b>Status do Caçador</b>\n"
-            f"• Estado: {status_txt}\n"
-            f"• Tempo ativo: {uptime_min} min\n"
-            f"• Alertas enviados: {estado['alertas_enviados']}\n"
-            f"• Canais monitorados: {len(banco['canais'])}\n"
-            f"• Desconto mínimo auto: {banco.get('desconto_minimo', 0)}%\n"
-            f"• MacroDroid: {'Configurado' if cfg['URL_MACRODROID'] else 'Desativado'}",
+            "⌨️ <b>Teclado rápido ativado na barra inferior!</b>",
             parse_mode="html",
+            buttons=converter_botoes_telethon(TECLADO_FIXO_SPEC),
         )
+        texto, spec = montar_painel_menu_spec(banco, estado_runtime, estado_persistente)
+        await event.reply(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+
+    elif comando == "/teclado":
+        await event.reply(
+            "⌨️ <b>Teclado fixo ativado na barra inferior!</b>",
+            parse_mode="html",
+            buttons=converter_botoes_telethon(TECLADO_FIXO_SPEC),
+        )
+
+    elif comando == "/cancelar":
+        await event.reply("❌ Nenhuma operação pendente.")
+
+    elif comando == "/add":
+        titulo, spec = montar_wizard_categoria_spec("add")
+        await event.reply(titulo, parse_mode="html", buttons=converter_botoes_telethon(spec))
+
+    elif comando == "/rem":
+        titulo, spec = montar_wizard_categoria_spec("rem")
+        await event.reply(titulo, parse_mode="html", buttons=converter_botoes_telethon(spec))
+
+    elif comando == "/menu":
+        texto, spec = montar_painel_menu_spec(banco, estado_runtime, estado_persistente)
+        await event.reply(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+
+    elif comando == "/ajuda":
+        await event.reply(_formatar_texto_ajuda(), parse_mode="html")
+
+    elif comando == "/prioridade":
+        await _processar_prioridade_texto(event, banco, argumento, caminho_json)
+
+    elif comando == "/lista":
+        await enviar_em_partes_fn(event.reply, _formatar_lista_painel(banco, estado_runtime), parse_mode="html")
+
+    elif comando == "/status":
+        await event.reply(_formatar_texto_status(banco, cfg, estado_runtime, estado_persistente), parse_mode="html")
+
+    elif comando == "/teste":
+        await _executar_teste_sistema(event.reply, cfg)
+
+    elif comando == "/ultimos":
+        await _enviar_ultimos(event.reply, estado_persistente)
+
+    elif comando == "/logs":
+        qtd = max(5, min(100, int(argumento))) if argumento.isdigit() else 30
+        await _enviar_logs(event.reply, qtd, caminho_log=caminho_log)
+
+    elif comando == "/backup":
+        await _enviar_backup(event.reply, bot_client, cfg["MEU_CHAT_ID"], caminho_json=caminho_json)
+
     elif comando == "/pausar":
-        estado["pausado"] = True
-        await event.reply("⏸️ Monitoramento pausado. Envie <code>/retomar</code> para voltar.", parse_mode="html")
+        if cmd_original == "/p" and estado_runtime["pausado"]:
+            estado_runtime["pausado"] = False
+            await event.reply("▶️ Monitoramento retomado!")
+        else:
+            estado_runtime["pausado"] = True
+            await event.reply("⏸️ Monitoramento pausado. Envie <code>/p</code> ou <code>/r</code> para voltar.", parse_mode="html")
+
     elif comando == "/retomar":
-        estado["pausado"] = False
+        estado_runtime["pausado"] = False
         await event.reply("▶️ Monitoramento retomado!", parse_mode="html")
-    elif comando == "/addcanal" and argumento:
-        novo = argumento.lower()
-        if not novo.startswith("@") and not novo.lstrip("-").isdigit():
-            novo = f"@{novo}"
-        if novo not in [c.lower() for c in banco["canais"]]:
-            banco["canais"].append(novo)
-            salvar_dados(banco)
-            await event.reply(f"✅ Alvo <code>{html.escape(novo)}</code> adicionado!", parse_mode="html")
-        else:
-            await event.reply(f"ℹ️ <code>{html.escape(novo)}</code> já está na lista.", parse_mode="html")
-    elif comando == "/delcanal" and argumento:
-        remover = argumento.lower()
-        if not remover.startswith("@") and not remover.lstrip("-").isdigit():
-            remover = f"@{remover}"
-        encontrado = next((c for c in banco["canais"] if c.lower() == remover), None)
-        if encontrado:
-            banco["canais"].remove(encontrado)
-            salvar_dados(banco)
-            await event.reply(f"🗑️ <code>{html.escape(encontrado)}</code> removido!", parse_mode="html")
-        else:
-            await event.reply(f"⚠️ <code>{html.escape(remover)}</code> não encontrado.", parse_mode="html")
-    elif comando in ("/addpalavra", "/delpalavra") and argumento:
-        resp = _gerenciar_lista_regex(banco, "palavras", comando == "/addpalavra", argumento, "Palavra")
-        await event.reply(resp, parse_mode="html")
-    elif comando in ("/addbloqueio", "/delbloqueio") and argumento:
-        resp = _gerenciar_lista_regex(banco, "negativas", comando == "/addbloqueio", argumento, "Bloqueio")
-        await event.reply(resp, parse_mode="html")
-    elif comando == "/addteto" and argumento:
-        try:
-            produto, preco_str = [x.strip() for x in argumento.rsplit(",", 1)]
-            preco = parse_numero_br(re.sub(r"(?i)r\$", "", preco_str).strip())
-            valida, erro = regex_valida(produto)
-            if not valida:
-                await event.reply(f"⚠️ Padrão inválido: <code>{html.escape(erro)}</code>", parse_mode="html")
-                return
-            if preco is None:
-                raise ValueError("Preço inválido")
-            banco["alvos_preco"][produto.lower()] = preco
-            salvar_dados(banco)
-            await event.reply(
-                f"🎯 <b>Teto adicionado!</b> Disparo para <b>{html.escape(produto)}</b> até <b>R$ {preco:.2f}</b>",
-                parse_mode="html",
-            )
-        except Exception:
-            await event.reply(
-                "⚠️ <b>Formato incorreto!</b>\nUse: <code>/addteto nome da peça, valor</code>",
-                parse_mode="html",
-            )
-    elif comando == "/delteto" and argumento:
-        alvo = argumento.lower().strip()
-        if alvo in banco["alvos_preco"]:
-            del banco["alvos_preco"][alvo]
-            salvar_dados(banco)
-            await event.reply(f"🗑️ Teto para <code>{html.escape(alvo)}</code> removido!", parse_mode="html")
-        else:
-            await event.reply("⚠️ Teto não encontrado.")
-    elif comando == "/addcomposto" and argumento:
-        try:
-            composto = parsear_comando_composto(argumento)
-            banco["alvos_compostos"] = [
-                c for c in banco["alvos_compostos"] if c.get("nome") != composto["nome"]
+
+    elif comando == "/addcanal":
+        if not argumento:
+            await event.reply("💡 Use: <code>/ac @canal</code> ou vários: <code>/ac @canal1 @canal2</code>", parse_mode="html")
+            return
+        _, msg = _executar_add_canal(banco, argumento, caminho_json)
+        await event.reply(msg, parse_mode="html")
+
+    elif comando == "/delcanal":
+        if not argumento:
+            await enviar_em_partes_fn(event.reply, formatar_lista_numerada(banco["canais"], "Canais", "/dc"), parse_mode="html")
+            return
+        removidos, nao_achados = remover_itens_lista(
+            banco["canais"], argumento, case_insensitive=True, normalizar_fn=_normalizar_canal, separar_espacos=True
+        )
+        if removidos:
+            salvar_dados(banco, caminho_json)
+        msgs = []
+        if removidos:
+            msgs.append(f"🗑️ Removido(s): {', '.join(f'<code>{html.escape(x)}</code>' for x in removidos)}")
+        if nao_achados:
+            msgs.append(f"⚠️ Não encontrado(s): {', '.join(html.escape(x) for x in nao_achados)}")
+        await event.reply("\n".join(msgs), parse_mode="html")
+
+    elif comando == "/addpalavra":
+        if not argumento:
+            await event.reply("💡 Use: <code>/ap termo</code> ou vários: <code>/ap termo1; termo2</code>", parse_mode="html")
+            return
+        _, msg = _adicionar_regex_lote(banco, "palavras", argumento, caminho_json)
+        await event.reply(msg, parse_mode="html")
+
+    elif comando == "/delpalavra":
+        if not argumento:
+            await enviar_em_partes_fn(event.reply, formatar_lista_numerada(banco["palavras"], "Palavras-Chave", "/dp"), parse_mode="html")
+            return
+        removidos, nao_achados = remover_itens_lista(banco["palavras"], argumento)
+        if removidos:
+            altas = banco.get("prioridades", {}).get("palavras_altas", [])
+            for r in removidos:
+                if r in altas:
+                    altas.remove(r)
+            salvar_dados(banco, caminho_json)
+        msgs = []
+        if removidos:
+            msgs.append(f"🗑️ Removida(s): {', '.join(f'<code>{html.escape(x)}</code>' for x in removidos)}")
+        if nao_achados:
+            msgs.append(f"⚠️ Não encontrada(s): {', '.join(html.escape(x) for x in nao_achados)}")
+        await event.reply("\n".join(msgs), parse_mode="html")
+
+    elif comando == "/addbloqueio":
+        if not argumento:
+            await event.reply("💡 Use: <code>/ab termo</code> ou vários: <code>/ab termo1; termo2</code>", parse_mode="html")
+            return
+        _, msg = _adicionar_regex_lote(banco, "negativas", argumento, caminho_json)
+        await event.reply(msg, parse_mode="html")
+
+    elif comando == "/delbloqueio":
+        if not argumento:
+            await enviar_em_partes_fn(event.reply, formatar_lista_numerada(banco["negativas"], "Bloqueios", "/db"), parse_mode="html")
+            return
+        removidos, nao_achados = remover_itens_lista(banco["negativas"], argumento)
+        if removidos:
+            salvar_dados(banco, caminho_json)
+        msgs = []
+        if removidos:
+            msgs.append(f"🗑️ Removido(s): {', '.join(f'<code>{html.escape(x)}</code>' for x in removidos)}")
+        if nao_achados:
+            msgs.append(f"⚠️ Não encontrado(s): {', '.join(html.escape(x) for x in nao_achados)}")
+        await event.reply("\n".join(msgs), parse_mode="html")
+
+    elif comando == "/addteto":
+        if not argumento:
+            await event.reply("💡 Use: <code>/at placa de vídeo, 400-1300</code> ou <code>/at ssd, 300</code>", parse_mode="html")
+            return
+        _, msg = _executar_add_teto(banco, argumento, caminho_json)
+        await event.reply(msg, parse_mode="html")
+
+    elif comando == "/delteto":
+        if not argumento:
+            itens = [
+                f"{k} ({formatar_faixa_preco(*normalizar_faixa_preco(v))})"
+                for k, v in banco["alvos_preco"].items()
             ]
-            banco["alvos_compostos"].append(composto)
-            salvar_dados(banco)
-            exc_txt = ", ".join(composto["excluir"]) if composto["excluir"] else "nenhuma"
+            await enviar_em_partes_fn(event.reply, formatar_lista_numerada(itens, "Tetos Simples", "/dt"), parse_mode="html")
+            return
+        removidos, nao_achados = remover_chaves_dict(banco["alvos_preco"], argumento)
+        if removidos:
+            salvar_dados(banco, caminho_json)
+        msgs = []
+        if removidos:
+            msgs.append(f"🗑️ Teto(s) removido(s): {', '.join(f'<code>{html.escape(x)}</code>' for x in removidos)}")
+        if nao_achados:
+            msgs.append(f"⚠️ Não encontrado(s): {', '.join(html.escape(x) for x in nao_achados)}")
+        await event.reply("\n".join(msgs), parse_mode="html")
+
+    elif comando == "/addcomposto":
+        if not argumento:
             await event.reply(
-                f"🧩 <b>Alvo composto salvo!</b>\n"
-                f"• Nome: <b>{html.escape(composto['nome'])}</b>\n"
-                f"• Exige: <code>{html.escape(' + '.join(composto['incluir']))}</code>\n"
-                f"• Exclui: <code>{html.escape(exc_txt)}</code>\n"
-                f"• Teto: <b>R$ {composto['teto']:.2f}</b>",
+                "💡 Use: <code>/ax ram16 | 16gb + ddr4 | notebook, sodimm | 120-220</code>\n"
+                "Ou sem exclusões: <code>/ax ssd1tb | ssd + 1tb | 200-380</code>",
                 parse_mode="html",
             )
-        except Exception as err:
+            return
+        _, msg = _executar_add_combo(banco, argumento, caminho_json)
+        await event.reply(msg, parse_mode="html")
+
+    elif comando == "/delcomposto":
+        if not argumento:
+            itens = [
+                f"{c['nome']} [{' + '.join(c['incluir'])}]"
+                for c in banco["alvos_compostos"]
+            ]
+            await enviar_em_partes_fn(event.reply, formatar_lista_numerada(itens, "Tetos Compostos", "/dx"), parse_mode="html")
+            return
+        removidos, nao_achados = remover_compostos(banco["alvos_compostos"], argumento)
+        if removidos:
+            salvar_dados(banco, caminho_json)
+        msgs = []
+        if removidos:
+            msgs.append(f"🗑️ Combo(s) removido(s): {', '.join(f'<code>{html.escape(x)}</code>' for x in removidos)}")
+        if nao_achados:
+            msgs.append(f"⚠️ Não encontrado(s): {', '.join(html.escape(x) for x in nao_achados)}")
+        await event.reply("\n".join(msgs), parse_mode="html")
+
+    elif comando == "/setdesconto":
+        if not argumento:
+            crit = float(banco.get("desconto_critico", 75) or 75)
+            crit_txt = "OFF" if crit >= 100 else f"{crit:.0f}%"
             await event.reply(
-                f"⚠️ <b>Formato incorreto</b> ({html.escape(str(err))}).\n"
-                "Use: <code>/addcomposto ram16 | 16gb + ddr4 | notebook, sodimm | 220</code>\n"
-                "Ou sem exclusões: <code>/addcomposto ram16 | 16gb + ddr4 | 220</code>",
+                f"📉 Atual: Normal ≥ <b>{banco.get('desconto_minimo', 0):.0f}%</b> | Alta <b>{crit_txt}</b>\n"
+                f"Use <code>/sd 65, 75</code> ou <code>/sd 65, off</code> (<code>0</code> desativa).",
                 parse_mode="html",
             )
-    elif comando == "/delcomposto" and argumento:
-        alvo = argumento.lower().strip()
-        antes = len(banco["alvos_compostos"])
-        banco["alvos_compostos"] = [c for c in banco["alvos_compostos"] if c.get("nome") != alvo]
-        if len(banco["alvos_compostos"]) < antes:
-            salvar_dados(banco)
-            await event.reply(f"🗑️ Alvo composto <code>{html.escape(alvo)}</code> removido!", parse_mode="html")
-        else:
-            await event.reply("⚠️ Alvo composto não encontrado.")
-    elif comando == "/setdesconto" and argumento:
+            return
         try:
-            valor = float(argumento.replace("%", "").replace(",", ".").strip())
-            if valor < 0 or valor >= 100:
-                raise ValueError("Percentual fora de 0..99")
-            banco["desconto_minimo"] = valor
-            salvar_dados(banco)
-            if valor == 0:
+            tokens = [x.strip() for x in re.split(r"[\s,]+", argumento) if x.strip()]
+            min_v = float(tokens[0].replace("%", "").replace(",", "."))
+            crit_v = None
+            if len(tokens) >= 2:
+                crit_v = 100.0 if tokens[1].lower() in ("off", "0") else float(tokens[1].replace("%", "").replace(",", "."))
+            _aplicar_setdesconto(banco, min_v, crit_v, caminho_json)
+            if banco["desconto_minimo"] == 0:
                 await event.reply("🔕 Detector automático de queda de preço desativado.")
             else:
+                crit_txt = "OFF (só silenc.)" if banco["desconto_critico"] >= 100 else f"≥ {banco['desconto_critico']:.0f}%"
                 await event.reply(
-                    f"📉 Detector automático configurado para quedas ≥ <b>{valor:.0f}%</b>.",
+                    f"📉 Queda automática: Normal ≥ <b>{banco['desconto_minimo']:.0f}%</b> | Alta <b>{crit_txt}</b>.",
                     parse_mode="html",
                 )
         except Exception:
-            await event.reply("⚠️ Use <code>/setdesconto 65</code> (ou <code>0</code> para desativar).", parse_mode="html")
+            await event.reply("⚠️ Use <code>/sd 65</code> ou <code>/sd 65, 75</code> (<code>0</code> desativa).", parse_mode="html")
+
+    elif comando == "/dnd":
+        dnd = banco.setdefault("nao_perturbe", {"ativo": True, "inicio": 0, "fim": 7})
+        arg = argumento.lower()
+        if not arg:
+            st = f"ON ({dnd['inicio']:02d}h às {dnd['fim']:02d}h)" if dnd.get("ativo") else "OFF"
+            await event.reply(f"🌙 Modo Não Perturbe: <b>{st}</b>\nUse <code>/dnd 0-7</code> ou <code>/dnd off</code>.", parse_mode="html")
+        elif arg in ("off", "desativar", "0"):
+            dnd["ativo"] = False
+            salvar_dados(banco, caminho_json)
+            await event.reply("☀️ Modo Não Perturbe desativado.")
+        elif arg in ("on", "ativar"):
+            dnd["ativo"] = True
+            salvar_dados(banco, caminho_json)
+            await event.reply(f"🌙 Modo Não Perturbe ativado: <b>{dnd['inicio']:02d}h às {dnd['fim']:02d}h</b>.", parse_mode="html")
+        else:
+            m = re.match(r"^(\d{1,2})\s*[-a]\s*(\d{1,2})$", arg)
+            if not m:
+                await event.reply("⚠️ Use <code>/dnd 0-7</code>, <code>/dnd 23-7</code> ou <code>/dnd off</code>.", parse_mode="html")
+                return
+            ini, fim = int(m.group(1)), int(m.group(2))
+            if not (0 <= ini <= 23 and 0 <= fim <= 23):
+                await event.reply("⚠️ Horas devem estar entre 0 e 23.")
+                return
+            dnd.update({"ativo": True, "inicio": ini, "fim": fim})
+            salvar_dados(banco, caminho_json)
+            await event.reply(f"🌙 Modo Não Perturbe ativado: <b>{ini:02d}h às {fim:02d}h</b>.", parse_mode="html")
+
+    elif comando == "/filtro":
+        filtros = banco.setdefault("filtros_extras", {"bloquear_usados": False, "bloquear_importacao": False})
+        tokens = argumento.lower().split()
+        if not tokens:
+            await event.reply(
+                f"🧹 <b>Filtros Extras</b>\n"
+                f"• Usados/recondicionados: <b>{'ON' if filtros.get('bloquear_usados') else 'OFF'}</b>\n"
+                f"• Compra internacional: <b>{'ON' if filtros.get('bloquear_importacao') else 'OFF'}</b>\n\n"
+                f"Use: <code>/filtro usados on</code> ou <code>/filtro importacao off</code>",
+                parse_mode="html",
+            )
+            return
+        alvo = tokens[0]
+        ligar = (tokens[1] in ("on", "1", "sim", "ativar")) if len(tokens) > 1 else None
+        if alvo.startswith("usad"):
+            novo = (not filtros.get("bloquear_usados")) if ligar is None else ligar
+            filtros["bloquear_usados"] = novo
+            salvar_dados(banco, caminho_json)
+            await event.reply(f"🧹 Bloqueio de usados/recondicionados: <b>{'ON' if novo else 'OFF'}</b>", parse_mode="html")
+        elif alvo.startswith("import"):
+            novo = (not filtros.get("bloquear_importacao")) if ligar is None else ligar
+            filtros["bloquear_importacao"] = novo
+            salvar_dados(banco, caminho_json)
+            await event.reply(f"🧹 Bloqueio de compra internacional: <b>{'ON' if novo else 'OFF'}</b>", parse_mode="html")
+        else:
+            await event.reply("⚠️ Use <code>/filtro usados on|off</code> ou <code>/filtro importacao on|off</code>.", parse_mode="html")
+
+    elif comando == "/resumo":
+        arg = argumento.lower()
+        if not arg:
+            h = banco.get("resumo_hora")
+            txt = f"{int(h):02d}:00" if h is not None and int(h) >= 0 else "OFF"
+            await event.reply(f"📊 Resumo diário automático: <b>{txt}</b>\nUse <code>/resumo 21</code> ou <code>/resumo off</code>.", parse_mode="html")
+        elif arg in ("off", "desativar"):
+            banco["resumo_hora"] = None
+            salvar_dados(banco, caminho_json)
+            await event.reply("🔕 Resumo diário automático desativado.")
+        elif arg.isdigit() and 0 <= int(arg) <= 23:
+            banco["resumo_hora"] = int(arg)
+            salvar_dados(banco, caminho_json)
+            await event.reply(f"📊 Resumo diário agendado para as <b>{int(arg):02d}:00</b>.", parse_mode="html")
+        else:
+            await event.reply("⚠️ Informe uma hora de 0 a 23 (ex.: <code>/resumo 21</code>) ou <code>off</code>.", parse_mode="html")
+
+
+async def _substituir_botao_alerta(event, novo_rotulo):
+    """Troca o botão inline clicado no alerta por um rótulo informativo."""
+    try:
+        msg_orig = await event.get_message()
+        novos_botoes = []
+        for linha in msg_orig.buttons or []:
+            nova_linha = []
+            for btn in linha:
+                if getattr(btn, "data", b"") == event.data:
+                    nova_linha.append(Button.inline(novo_rotulo, b"noop"))
+                else:
+                    nova_linha.append(btn)
+            novos_botoes.append(nova_linha)
+        if novos_botoes:
+            await event.edit(buttons=novos_botoes)
+    except Exception:
+        pass
+
+
+def _parar_monitorar_por_hash(banco, codigo_tipo, hash_alvo, caminho_json=ARQUIVO_JSON):
+    """Remove palavra, teto ou combo pelo código de tipo e hash curto do alvo."""
+    if codigo_tipo == "p":
+        alvo = next((p for p in banco.get("palavras", []) if hash_curto_chave(p) == hash_alvo), None)
+        if not alvo:
+            return None
+        banco["palavras"].remove(alvo)
+        altas = banco.get("prioridades", {}).get("palavras_altas", [])
+        if alvo in altas:
+            altas.remove(alvo)
+        salvar_dados(banco, caminho_json)
+        return alvo
+
+    if codigo_tipo == "t":
+        alvo = next((k for k in banco.get("alvos_preco", {}) if hash_curto_chave(k) == hash_alvo), None)
+        if not alvo:
+            return None
+        del banco["alvos_preco"][alvo]
+        salvar_dados(banco, caminho_json)
+        return alvo
+
+    if codigo_tipo == "c":
+        alvo = next((c for c in banco.get("alvos_compostos", []) if hash_curto_chave(c["nome"]) == hash_alvo), None)
+        if not alvo:
+            return None
+        banco["alvos_compostos"].remove(alvo)
+        salvar_dados(banco, caminho_json)
+        return alvo["nome"]
+
+    return None
+
+
+def _remover_item_wizard(banco, cat_codigo, idx, caminho_json=ARQUIVO_JSON):
+    """Remove um item pelo índice dentro da categoria do assistente ➖ Remover."""
+    removido = None
+    if cat_codigo == "p":
+        lista = banco.get("palavras", [])
+        if 0 <= idx < len(lista):
+            removido = lista.pop(idx)
+            altas = banco.get("prioridades", {}).get("palavras_altas", [])
+            if removido in altas:
+                altas.remove(removido)
+    elif cat_codigo == "t":
+        chaves = list(banco.get("alvos_preco", {}).keys())
+        if 0 <= idx < len(chaves):
+            removido = chaves[idx]
+            del banco["alvos_preco"][removido]
+    elif cat_codigo == "c":
+        lista = banco.get("alvos_compostos", [])
+        if 0 <= idx < len(lista):
+            removido = lista.pop(idx)["nome"]
+    elif cat_codigo == "g":
+        lista = banco.get("canais", [])
+        if 0 <= idx < len(lista):
+            removido = lista.pop(idx)
+    elif cat_codigo == "b":
+        lista = banco.get("negativas", [])
+        if 0 <= idx < len(lista):
+            removido = lista.pop(idx)
+
+    if removido is not None:
+        salvar_dados(banco, caminho_json)
+    return removido
+
+
+async def processar_callback_painel(
+    event,
+    banco,
+    cfg,
+    estado_runtime,
+    estado_persistente,
+    mapa_silenciar,
+    bot_client=None,
+    caminho_json=ARQUIVO_JSON,
+    caminho_estado=ARQUIVO_ESTADO,
+    caminho_log=ARQUIVO_LOG,
+):
+    """Processa todos os cliques em botões inline (silenciar, parar, wizard, menu e prioridades)."""
+    if event.sender_id != cfg["MEU_CHAT_ID"]:
+        await event.answer("Não autorizado.", alert=True)
+        return
+
+    data = (event.data or b"").decode("utf-8", errors="ignore")
+    if data == "noop":
+        await event.answer("Botão informativo.")
+        return
+
+    async def send_chat(texto, **kwargs):
+        if bot_client is not None:
+            return await bot_client.send_message(cfg["MEU_CHAT_ID"], texto, **kwargs)
+        return await event.respond(texto, **kwargs)
+
+    # 1. Silenciar produto por 3h direto do alerta
+    if data.startswith("sil:"):
+        hash_curto = data.split(":", 1)[1]
+        ttl_silencio = int(cfg["TEMPO_SILENCIO_HORAS"] * 3600)
+        chave_orig = mapa_silenciar.get(hash_curto)
+        if chave_orig:
+            registrar_historico(estado_persistente, chave_orig, ttl_silencio, caminho_estado)
+        registrar_historico(estado_persistente, f"sil_hash:{hash_curto}", ttl_silencio, caminho_estado)
+
+        await _substituir_botao_alerta(event, f"✅ Silenciado por {cfg['TEMPO_SILENCIO_HORAS']:g}h")
+        await event.answer(f"🤫 Produto silenciado por {cfg['TEMPO_SILENCIO_HORAS']:g}h!")
+        logger.info("Produto silenciado manualmente via botão (hash=%s, chave=%s).", hash_curto, chave_orig)
+        return
+
+    # 1b. Parar de monitorar o gatilho direto do alerta
+    if data.startswith("stop:"):
+        partes = data.split(":")
+        if len(partes) == 3:
+            removido = _parar_monitorar_por_hash(banco, partes[1], partes[2], caminho_json)
+            if removido:
+                await _substituir_botao_alerta(event, f"✅ Parou de monitorar: {removido[:20]}")
+                await event.answer(f"🔕 Parou de monitorar: {removido}")
+                logger.info("Gatilho removido pelo botão do alerta: %s (%s)", removido, partes[1])
+            else:
+                await _substituir_botao_alerta(event, "✅ Já removido")
+                await event.answer("Esse gatilho já havia sido removido.")
+        return
+
+    # 1c. Fluxos interativos Adicionar / Remover (wiz:*)
+    if data.startswith("wiz:"):
+        partes = data.split(":")
+        sub = partes[1]
+
+        if sub == "cancel":
+            estado_runtime["aguardando"] = None
+            await event.edit("❌ Operação cancelada.", buttons=None)
+            await event.answer("Cancelado")
+            return
+
+        if sub == "rem":
+            estado_runtime["aguardando"] = None
+            titulo, spec = montar_wizard_categoria_spec("rem")
+            await event.edit(titulo, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            await event.answer()
+            return
+
+        if sub == "add" and len(partes) >= 3:
+            cat = partes[2]
+            if cat in WIZARD_CATEGORIAS:
+                tipo_nome, _ = WIZARD_CATEGORIAS[cat]
+                estado_runtime["aguardando"] = f"add:{tipo_nome}"
+                await event.edit(
+                    PROMPTS_ADICIONAR[tipo_nome],
+                    parse_mode="html",
+                    buttons=converter_botoes_telethon([[("inline", "❌ Cancelar", "wiz:cancel")]]),
+                )
+            await event.answer()
+            return
+
+        if sub == "delcat" and len(partes) >= 3:
+            cat = partes[2]
+            pagina = int(partes[3]) if len(partes) >= 4 else 0
+            titulo, spec = montar_wizard_remover_itens_spec(banco, cat, pagina)
+            await event.edit(titulo, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            await event.answer()
+            return
+
+        if sub == "del" and len(partes) >= 5:
+            cat, idx, pagina = partes[2], int(partes[3]), int(partes[4])
+            removido = _remover_item_wizard(banco, cat, idx, caminho_json)
+            titulo, spec = montar_wizard_remover_itens_spec(banco, cat, pagina)
+            try:
+                await event.edit(titulo, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            except Exception:
+                pass
+            await event.answer(f"🗑️ Removido: {removido}" if removido else "Item não encontrado")
+            return
+
+    # 2. Ações do /menu
+    if data.startswith("menu:"):
+        acao = data.split(":", 1)[1]
+        atualizar_menu = False
+        toast = "Atualizado!"
+
+        if acao == "home":
+            atualizar_menu = True
+        elif acao == "pausa":
+            estado_runtime["pausado"] = not estado_runtime["pausado"]
+            atualizar_menu = True
+            toast = "⏸️ Pausado!" if estado_runtime["pausado"] else "▶️ Retomado!"
+        elif acao == "dnd":
+            dnd = banco.setdefault("nao_perturbe", {"ativo": True, "inicio": 0, "fim": 7})
+            dnd["ativo"] = not dnd.get("ativo", False)
+            salvar_dados(banco, caminho_json)
+            atualizar_menu = True
+            toast = f"🌙 DND {'ativado' if dnd['ativo'] else 'desativado'}!"
+        elif acao == "usados":
+            flt = banco.setdefault("filtros_extras", {"bloquear_usados": False, "bloquear_importacao": False})
+            flt["bloquear_usados"] = not flt.get("bloquear_usados", False)
+            salvar_dados(banco, caminho_json)
+            atualizar_menu = True
+            toast = f"🧹 Filtro usados {'ON' if flt['bloquear_usados'] else 'OFF'}"
+        elif acao == "import":
+            flt = banco.setdefault("filtros_extras", {"bloquear_usados": False, "bloquear_importacao": False})
+            flt["bloquear_importacao"] = not flt.get("bloquear_importacao", False)
+            salvar_dados(banco, caminho_json)
+            atualizar_menu = True
+            toast = f"✈️ Filtro importação {'ON' if flt['bloquear_importacao'] else 'OFF'}"
+        elif acao == "lista":
+            await event.answer()
+            await enviar_em_partes_fn(send_chat, _formatar_lista_painel(banco, estado_runtime), parse_mode="html")
+            return
+        elif acao == "status":
+            await event.answer()
+            await send_chat(_formatar_texto_status(banco, cfg, estado_runtime, estado_persistente), parse_mode="html")
+            return
+        elif acao == "teste":
+            await event.answer("Executando teste...")
+            await _executar_teste_sistema(send_chat, cfg)
+            return
+        elif acao == "ultimos":
+            await event.answer()
+            await _enviar_ultimos(send_chat, estado_persistente)
+            return
+        elif acao == "logs":
+            await event.answer()
+            await _enviar_logs(send_chat, 30, caminho_log=caminho_log)
+            return
+        elif acao == "backup":
+            await event.answer()
+            await _enviar_backup(send_chat, bot_client, cfg["MEU_CHAT_ID"], caminho_json=caminho_json)
+            return
+        elif acao == "ajuda":
+            await event.answer()
+            await send_chat(_formatar_texto_ajuda(), parse_mode="html")
+            return
+
+        if atualizar_menu:
+            texto, spec = montar_painel_menu_spec(banco, estado_runtime, estado_persistente)
+            try:
+                await event.edit(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            except Exception:
+                pass
+            await event.answer(toast)
+        return
+
+    # 3. Ações de Prioridades e Faixas (/prioridade)
+    if data.startswith("prio:"):
+        partes = data.split(":")
+        sub = partes[1]
+        prio = banco.setdefault("prioridades", {"teto": "alta", "combo": "alta", "palavras_altas": []})
+        toast = "Atualizado!"
+
+        if sub == "main":
+            texto, spec = montar_painel_prioridades_spec(banco)
+            await event.edit(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            await event.answer()
+            return
+
+        if sub in ("teto", "combo"):
+            novo = "normal" if prio.get(sub, "alta") == "alta" else "alta"
+            prio[sub] = novo
+            salvar_dados(banco, caminho_json)
+            toast = f"{sub.capitalize()}: {novo.upper()}"
+        elif sub == "dmin":
+            delta = int(partes[2])
+            atual = float(banco.get("desconto_minimo", 65) or 0)
+            crit = float(banco.get("desconto_critico", 75) or 75)
+            if delta > 0 and atual == 0:
+                novo_min = min(50.0, crit)
+            else:
+                novo_min = max(0.0, min(95.0, atual + delta))
+            novo_crit = max(novo_min, crit) if novo_min > 0 else crit
+            _aplicar_setdesconto(banco, novo_min, novo_crit, caminho_json)
+            toast = f"Normal: {novo_min:.0f}%" if novo_min > 0 else "Queda automática OFF"
+        elif sub == "dcrit":
+            delta = int(partes[2])
+            atual_min = float(banco.get("desconto_minimo", 65) or 0)
+            atual_crit = float(banco.get("desconto_critico", 75) or 75)
+            novo_crit = max(atual_min, min(100.0, atual_crit + delta))
+            _aplicar_setdesconto(banco, atual_min, novo_crit, caminho_json)
+            toast = "Alta em quedas OFF" if novo_crit >= 100 else f"Alta: ≥ {novo_crit:.0f}%"
+        elif sub == "pal":
+            pagina = int(partes[2])
+            texto, spec = montar_painel_palavras_prio_spec(banco, pagina)
+            await event.edit(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            await event.answer()
+            return
+        elif sub == "w":
+            idx = int(partes[2])
+            pagina = int(partes[3])
+            palavras = banco.get("palavras", [])
+            if 0 <= idx < len(palavras):
+                palavra = palavras[idx]
+                novo = alternar_prioridade_palavra(banco, palavra)
+                salvar_dados(banco, caminho_json)
+                toast = f"{palavra}: {'🔴 ALTA' if novo == 'alta' else '🟡 NORMAL'}"
+            texto, spec = montar_painel_palavras_prio_spec(banco, pagina)
+            try:
+                await event.edit(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            except Exception:
+                pass
+            await event.answer(toast)
+            return
+
+        texto, spec = montar_painel_prioridades_spec(banco)
+        try:
+            await event.edit(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+        except Exception:
+            pass
+        await event.answer(toast)
 
 
 async def _resolver_link_e_produto(links_atuais, chat_id, agora, memoria_canais):
@@ -1010,17 +1288,157 @@ async def _resolver_link_e_produto(links_atuais, chat_id, agora, memoria_canais)
     return link_para_abrir, link_oferta_bruto, info_produto, links_combinados, texto_recuperado
 
 
+async def _enviar_alerta_telegram(
+    bot_client,
+    user_client,
+    event_origem,
+    chat_id_destino,
+    mensagem,
+    legenda_foto,
+    botoes,
+    silencioso,
+):
+    """Envia alerta com a foto original (se houver) ou mensagem HTML, com fallback seguro."""
+    foto = getattr(event_origem, "photo", None)
+    if foto:
+        try:
+            buf = io.BytesIO()
+            await user_client.download_media(foto, file=buf)
+            if buf.tell() > 0:
+                buf.seek(0)
+                buf.name = "oferta.jpg"
+                sent = await bot_client.send_file(
+                    chat_id_destino,
+                    buf,
+                    caption=legenda_foto,
+                    parse_mode="html",
+                    buttons=botoes,
+                    silent=silencioso,
+                )
+                return sent, True
+        except Exception as err:
+            logger.warning("Falha ao enviar foto (%s); enviando como texto.", err)
+
+    try:
+        sent = await bot_client.send_message(
+            chat_id_destino,
+            mensagem,
+            parse_mode="html",
+            link_preview=False,
+            buttons=botoes,
+            silent=silencioso,
+        )
+        return sent, False
+    except Exception as err:
+        logger.error("Erro ao enviar alerta HTML (%s); tentando texto simples.", err)
+        sent = await bot_client.send_message(
+            chat_id_destino,
+            re.sub(r"<[^>]+>", "", mensagem),
+            link_preview=False,
+            silent=silencioso,
+        )
+        return sent, False
+
+
+async def _enriquecer_alerta_vago(sent_msg, foi_foto, contexto_msg):
+    """Para posts vagos, busca o título real da página e edita o alerta logo após o envio."""
+    url = contexto_msg.get("link_oferta")
+    if not url:
+        return
+    try:
+        meta = await asyncio.to_thread(buscar_metadados_pagina, url)
+        titulo = meta.get("titulo")
+        preco = meta.get("preco")
+        if not titulo and not preco:
+            return
+
+        url_comp = contexto_msg.get("url_comparacao") or gerar_url_comparacao(
+            contexto_msg["info_produto"],
+            titulo or contexto_msg["texto_bruto"],
+            url,
+        )
+        msg_nova, legenda_nova, botoes_spec = montar_mensagem_e_botoes_spec(
+            nome_grupo=contexto_msg["nome_grupo"],
+            motivo_disparo=contexto_msg["motivo_disparo"],
+            prioridade=contexto_msg["prioridade"],
+            texto_bruto=contexto_msg["texto_bruto"],
+            cupons=contexto_msg["cupons"],
+            info_produto=contexto_msg["info_produto"],
+            link_oferta=url,
+            link_origem=contexto_msg["link_origem"],
+            links_extras=contexto_msg["links_extras"],
+            texto_recuperado=contexto_msg["texto_recuperado"],
+            titulo_detectado=titulo,
+            preco_detectado=preco,
+            url_comparacao=url_comp,
+            chave_silenciar=contexto_msg["chave_curta"],
+            tipo_gatilho=contexto_msg.get("tipo_gatilho"),
+            alvo_gatilho=contexto_msg.get("alvo_gatilho"),
+        )
+        await sent_msg.edit(
+            legenda_nova if foi_foto else msg_nova,
+            parse_mode="html",
+            buttons=converter_botoes_telethon(botoes_spec),
+            link_preview=False,
+        )
+        logger.info("Alerta vago atualizado com título: %s", titulo)
+    except Exception as err:
+        logger.debug("Não foi possível editar alerta vago: %s", err)
+
+
+async def _loop_resumo_diario(bot_client, cfg, banco, estado_persistente):
+    """Envia o resumo diário automaticamente no horário configurado."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            resumo_hora = banco.get("resumo_hora")
+            if resumo_hora is None or int(resumo_hora) < 0:
+                continue
+
+            agora_dt = datetime.datetime.now()
+            hoje = agora_dt.date().isoformat()
+            stats = garantir_stats_do_dia(estado_persistente, hoje)
+
+            if agora_dt.hour == int(resumo_hora) and estado_persistente.get("ultimo_resumo_data") != hoje:
+                texto = formatar_resumo_diario(stats, agora_dt.strftime("%d/%m/%Y"))
+                await bot_client.send_message(cfg["MEU_CHAT_ID"], texto, parse_mode="html", silent=True)
+                estado_persistente["ultimo_resumo_data"] = hoje
+                salvar_estado_persistente(estado_persistente, ARQUIVO_ESTADO)
+                logger.info("Resumo diário enviado (%s).", hoje)
+        except asyncio.CancelledError:
+            break
+        except Exception as err:
+            logger.warning("Erro no loop de resumo diário: %s", err)
+
+
+async def registrar_comandos_telegram(bot_client):
+    """Registra o menu '/' nativo do Telegram com descrições dos comandos."""
+    comandos = [types.BotCommand(command=cmd, description=desc) for cmd, desc in COMANDOS_BOT_MENU]
+    try:
+        await bot_client(
+            functions.bots.SetBotCommandsRequest(
+                scope=types.BotCommandScopeDefault(),
+                lang_code="",
+                commands=comandos,
+            )
+        )
+        logger.info("Menu de comandos '/' registrado no Telegram (%d comandos).", len(comandos))
+    except Exception as err:
+        logger.warning("Não foi possível registrar menu '/' no Telegram: %s", err)
+
+
 async def main():
     cfg = carregar_configuracoes()
-    banco = carregar_dados(desconto_padrao=cfg["DESCONTO_MINIMO_AUTO"])
+    banco = carregar_dados(desconto_padrao=cfg["DESCONTO_MINIMO_AUTO"], desconto_critico=cfg["DESCONTO_CRITICO_MACRODROID"])
+    estado_persistente = carregar_estado_persistente(ARQUIVO_ESTADO)
 
     memoria_canais = {}
-    historico_alertas = {}
-    estado = {
+    mapa_silenciar = {}
+    estado_runtime = {
         "ultimo_disparo": 0.0,
         "pausado": False,
-        "alertas_enviados": 0,
         "inicio": time.time(),
+        "aguardando": None,
     }
 
     sessao_user = os.path.join(BASE_DIR, "sessao_bot")
@@ -1030,7 +1448,16 @@ async def main():
 
     @bot_client.on(events.NewMessage(chats=cfg["MEU_CHAT_ID"]))
     async def painel(event):
-        await processar_comando_painel(event, banco, cfg, estado)
+        if event.document and not (event.raw_text or "").strip().startswith("/"):
+            if await processar_backup_recebido(event, banco, ARQUIVO_JSON):
+                return
+        await processar_comando_painel(event, banco, cfg, estado_runtime, estado_persistente, bot_client=bot_client)
+
+    @bot_client.on(events.CallbackQuery())
+    async def acoes_inline(event):
+        await processar_callback_painel(
+            event, banco, cfg, estado_runtime, estado_persistente, mapa_silenciar, bot_client=bot_client
+        )
 
     @user_client.on(events.NewMessage())
     async def ninja_id(event):
@@ -1045,14 +1472,14 @@ async def main():
                 f"🕵️‍♂️ <b>RAIO-X DE CHAT</b>\n\n"
                 f"<b>Nome:</b> {html.escape(nome)}\n"
                 f"<b>ID:</b> <code>{event.chat_id}</code>\n\n"
-                f"Para monitorar, envie no bot:\n<code>/addcanal {event.chat_id}</code>"
+                f"Para monitorar, envie no bot:\n<code>/ac {event.chat_id}</code>"
             )
             await bot_client.send_message(cfg["MEU_CHAT_ID"], msg, parse_mode="html")
 
     @user_client.on(events.NewMessage())
     @user_client.on(events.MessageEdited())
     async def cacador(event):
-        if estado["pausado"] or event.is_private or event.out:
+        if estado_runtime["pausado"] or event.is_private or event.out:
             return
 
         texto_bruto = event.raw_text or ""
@@ -1068,36 +1495,45 @@ async def main():
         if canal_username not in lista_canais and chat_id not in lista_canais:
             return
 
-        agora = time.time()
-        links_atuais = extrair_links_mensagem(texto_bruto, event.entities)
-        if links_atuais:
-            memoria_canais[chat_id] = {
-                "raw_text": texto_bruto,
-                "links": links_atuais,
-                "tempo": agora,
-            }
+        stats = garantir_stats_do_dia(estado_persistente)
+        stats["mensagens_lidas"] += 1
 
-        disparar, motivo = avaliar_gatilhos(texto_bruto, banco)
+        agora = time.time()
+        links_atuais = extrair_links_mensagem(texto_bruto, event.entities, text_url_cls=MessageEntityTextUrl)
+        if links_atuais:
+            memoria_canais[chat_id] = {"raw_text": texto_bruto, "links": links_atuais, "tempo": agora}
+
+        avaliacao = avaliar_gatilhos(texto_bruto, banco)
         nome_grupo = getattr(chat, "title", canal_username or chat_id)
-        if not disparar:
-            logger.info("Ignorado [%s]: %s | trecho=%r", nome_grupo, motivo, texto_bruto[:80])
+        if not avaliacao["disparar"]:
+            if avaliacao["bloqueado_por"]:
+                stats["bloqueios_negativos"] += 1
+            logger.info("Ignorado [%s]: %s | trecho=%r", nome_grupo, avaliacao["motivo"], texto_bruto[:80])
+            return
+
+        prioridade = avaliacao["prioridade"]
+        motivo = avaliacao["motivo"]
+
+        if prioridade != "alta" and eh_horario_dnd(banco.get("nao_perturbe")):
+            stats["bloqueios_dnd"] += 1
+            logger.info("Silenciado pelo DND [%s]: %s", nome_grupo, motivo)
             return
 
         link_para_abrir, link_bruto, info_produto, links_combinados, texto_recuperado = (
             await _resolver_link_e_produto(links_atuais, chat_id, agora, memoria_canais)
         )
 
-        expiradas = [k for k, ts in historico_alertas.items() if (agora - ts) > cfg["TEMPO_DUPLICATA"]]
-        for k in expiradas:
-            del historico_alertas[k]
-
-        chave_unica = montar_chave_duplicata(
-            info_produto, link_para_abrir or link_bruto, motivo, texto_bruto
-        )
-        if chave_unica in historico_alertas:
-            logger.info("Duplicata ignorada [%s]: chave=%s (%s)", nome_grupo, chave_unica, motivo)
+        chave_unica = montar_chave_duplicata(info_produto, link_para_abrir or link_bruto, motivo, texto_bruto)
+        chave_curto = hash_curto_chave(chave_unica)
+        if esta_no_historico(estado_persistente, chave_unica, agora) or esta_no_historico(
+            estado_persistente, f"sil_hash:{chave_curto}", agora
+        ):
+            stats["duplicatas_barradas"] += 1
+            logger.info("Duplicata/silenciada ignorada [%s]: chave=%s (%s)", nome_grupo, chave_unica, motivo)
             return
-        historico_alertas[chave_unica] = agora
+
+        registrar_historico(estado_persistente, chave_unica, cfg["TEMPO_DUPLICATA"], ARQUIVO_ESTADO, agora)
+        mapa_silenciar[chave_curto] = chave_unica
 
         if username:
             link_origem = f"https://t.me/{username}/{event.id}"
@@ -1106,9 +1542,11 @@ async def main():
             link_origem = f"https://t.me/c/{chat_id_limpo}/{event.id}"
 
         cupons = extrair_cupons(f"{texto_bruto}\n{texto_recuperado or ''}")
-        mensagem, botoes = montar_mensagem_e_botoes(
+        url_comparacao = gerar_url_comparacao(info_produto, texto_bruto, link_para_abrir)
+        mensagem, legenda_foto, botoes_spec = montar_mensagem_e_botoes_spec(
             nome_grupo=nome_grupo,
             motivo_disparo=motivo,
+            prioridade=prioridade,
             texto_bruto=texto_bruto,
             cupons=cupons,
             info_produto=info_produto,
@@ -1116,53 +1554,98 @@ async def main():
             link_origem=link_origem,
             links_extras=links_combinados,
             texto_recuperado=texto_recuperado,
+            url_comparacao=url_comparacao,
+            chave_silenciar=chave_curto,
+            tipo_gatilho=avaliacao.get("tipo_gatilho"),
+            alvo_gatilho=avaliacao.get("alvo_gatilho"),
         )
+        botoes = converter_botoes_telethon(botoes_spec)
+        silencioso = prioridade != "alta"
 
         logger.info(
-            "DISPARO [%s] motivo=%s chave=%s loja=%s link=%s cupons=%s",
-            nome_grupo,
-            motivo,
-            chave_unica,
-            info_produto.get("loja"),
-            link_para_abrir,
-            cupons,
+            "DISPARO [%s] prio=%s motivo=%s chave=%s loja=%s link=%s cupons=%s",
+            nome_grupo, prioridade, motivo, chave_unica, info_produto.get("loja"), link_para_abrir, cupons,
         )
 
-        try:
-            await bot_client.send_message(
-                cfg["MEU_CHAT_ID"],
-                mensagem,
-                parse_mode="html",
-                link_preview=False,
-                buttons=botoes,
-            )
-            estado["alertas_enviados"] += 1
-        except Exception as err:
-            logger.error("Erro ao enviar alerta HTML (%s); tentando texto simples.", err)
-            await bot_client.send_message(
-                cfg["MEU_CHAT_ID"],
-                f"ALERTA [{nome_grupo}] ({motivo})\n\n{texto_bruto}\n\n{link_para_abrir or link_origem}",
-                link_preview=False,
-            )
-            estado["alertas_enviados"] += 1
+        sent_msg, foi_foto = await _enviar_alerta_telegram(
+            bot_client, user_client, event, cfg["MEU_CHAT_ID"], mensagem, legenda_foto, botoes, silencioso
+        )
+        stats["alertas_enviados"] += 1
+        registrar_alerta_enviado(
+            estado_persistente,
+            {
+                "hora": datetime.datetime.now().strftime("%H:%M"),
+                "grupo": nome_grupo,
+                "loja": info_produto.get("loja"),
+                "motivo": motivo,
+                "prioridade": prioridade,
+                "link": link_para_abrir or link_origem,
+            },
+            ARQUIVO_ESTADO,
+        )
 
-        if cfg["URL_MACRODROID"] and link_para_abrir and (agora - estado["ultimo_disparo"]) >= cfg["TEMPO_DE_ESPERA"]:
+        if alerta_eh_vago(texto_bruto) and link_para_abrir and sent_msg is not None:
+            asyncio.create_task(
+                _enriquecer_alerta_vago(
+                    sent_msg,
+                    foi_foto,
+                    {
+                        "nome_grupo": nome_grupo,
+                        "motivo_disparo": motivo,
+                        "prioridade": prioridade,
+                        "texto_bruto": texto_bruto,
+                        "cupons": cupons,
+                        "info_produto": info_produto,
+                        "link_oferta": link_para_abrir,
+                        "link_origem": link_origem,
+                        "links_extras": links_combinados,
+                        "texto_recuperado": texto_recuperado,
+                        "url_comparacao": url_comparacao,
+                        "chave_curta": chave_curto,
+                        "tipo_gatilho": avaliacao.get("tipo_gatilho"),
+                        "alvo_gatilho": avaliacao.get("alvo_gatilho"),
+                    },
+                )
+            )
+
+        if (
+            prioridade == "alta"
+            and cfg["URL_MACRODROID"]
+            and link_para_abrir
+            and (agora - estado_runtime["ultimo_disparo"]) >= cfg["TEMPO_DE_ESPERA"]
+        ):
             try:
                 status_http = await asyncio.to_thread(disparar_macrodroid, cfg["URL_MACRODROID"], link_para_abrir)
-                estado["ultimo_disparo"] = agora
+                estado_runtime["ultimo_disparo"] = agora
                 logger.info("MacroDroid acionado (HTTP %s) com %s", status_http, link_para_abrir)
             except Exception as err:
                 logger.warning("Falha ao acionar MacroDroid: %s", err)
 
-    logger.info("✅ Sistema Definitivo v2 rodando! Monitorando %d canais.", len(banco["canais"]))
+    logger.info("✅ Sistema Definitivo v3.1 rodando! Monitorando %d canais.", len(banco["canais"]))
     await user_client.start()
     await bot_client.start(bot_token=cfg["BOT_TOKEN"])
+    await registrar_comandos_telegram(bot_client)
+
+    try:
+        await bot_client.send_message(
+            cfg["MEU_CHAT_ID"],
+            f"🟢 <b>Caçador online!</b> Monitorando <b>{len(banco['canais'])}</b> canais.\nUse os botões abaixo ou /menu para configurar.",
+            parse_mode="html",
+            buttons=converter_botoes_telethon(TECLADO_FIXO_SPEC),
+            silent=True,
+        )
+    except Exception as err:
+        logger.warning("Não foi possível enviar aviso de inicialização: %s", err)
+
+    tarefa_resumo = asyncio.create_task(_loop_resumo_diario(bot_client, cfg, banco, estado_persistente))
     try:
         await asyncio.gather(
             user_client.run_until_disconnected(),
             bot_client.run_until_disconnected(),
         )
     finally:
+        tarefa_resumo.cancel()
+        salvar_estado_persistente(estado_persistente, ARQUIVO_ESTADO)
         await user_client.disconnect()
         await bot_client.disconnect()
         logger.info("Clientes desconectados com segurança.")

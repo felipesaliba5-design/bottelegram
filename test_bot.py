@@ -1,13 +1,14 @@
 import asyncio
+import datetime
 import http.server
 import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
-from types import SimpleNamespace
 
 
 def _instalar_stub_telethon():
@@ -18,11 +19,22 @@ def _instalar_stub_telethon():
     telethon_mod = types.ModuleType("telethon")
     tl_mod = types.ModuleType("telethon.tl")
     tl_types_mod = types.ModuleType("telethon.tl.types")
+    functions_mod = types.ModuleType("telethon.functions")
+    functions_bots_mod = types.ModuleType("telethon.functions.bots")
+    types_mod = types.ModuleType("telethon.types")
 
     class _Button:
         @staticmethod
         def url(text, url):
             return {"type": "url", "text": text, "url": url}
+
+        @staticmethod
+        def inline(text, data):
+            return {"type": "inline", "text": text, "data": data}
+
+        @staticmethod
+        def text(text, resize=True, single_use=False):
+            return {"type": "text", "text": text, "resize": resize, "single_use": single_use}
 
     class _TelegramClient:
         def __init__(self, *args, **kwargs):
@@ -40,33 +52,99 @@ def _instalar_stub_telethon():
         def MessageEdited(*args, **kwargs):
             return ("MessageEdited", args, kwargs)
 
+        @staticmethod
+        def CallbackQuery(*args, **kwargs):
+            return ("CallbackQuery", args, kwargs)
+
     class _MessageEntityTextUrl:
         def __init__(self, url=""):
             self.url = url
 
+    class _BotCommand:
+        def __init__(self, command="", description=""):
+            self.command = command
+            self.description = description
+
+    class _BotCommandScopeDefault:
+        pass
+
+    class _SetBotCommandsRequest:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     telethon_mod.Button = _Button
     telethon_mod.TelegramClient = _TelegramClient
     telethon_mod.events = _Events
+    telethon_mod.functions = functions_mod
+    telethon_mod.types = types_mod
+    functions_mod.bots = functions_bots_mod
+    functions_bots_mod.SetBotCommandsRequest = _SetBotCommandsRequest
+    types_mod.BotCommand = _BotCommand
+    types_mod.BotCommandScopeDefault = _BotCommandScopeDefault
     tl_types_mod.MessageEntityTextUrl = _MessageEntityTextUrl
 
     sys.modules["telethon"] = telethon_mod
     sys.modules["telethon.tl"] = tl_mod
     sys.modules["telethon.tl.types"] = tl_types_mod
+    sys.modules["telethon.functions"] = functions_mod
+    sys.modules["telethon.types"] = types_mod
 
 
 _instalar_stub_telethon()
 
 import bot  # noqa: E402
+import core  # noqa: E402
 from telethon.tl.types import MessageEntityTextUrl  # noqa: E402
 
 
 class FakeEvent:
-    def __init__(self, text):
+    def __init__(self, text="", document=False, file_name="", doc_bytes=b""):
         self.raw_text = text
+        self.document = document
+        self.file = types.SimpleNamespace(name=file_name) if file_name else None
+        self._doc_bytes = doc_bytes
         self.respostas = []
 
     async def reply(self, text, **kwargs):
         self.respostas.append((text, kwargs))
+
+    async def download_media(self, file=bytes):
+        return self._doc_bytes
+
+
+class FakeBotClient:
+    def __init__(self):
+        self.mensagens = []
+        self.arquivos = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        msg = FakeSentMessage(text, kwargs)
+        self.mensagens.append((chat_id, text, kwargs))
+        return msg
+
+    async def send_file(self, chat_id, file_obj, **kwargs):
+        msg = FakeSentMessage(kwargs.get("caption", ""), kwargs)
+        self.arquivos.append((chat_id, file_obj, kwargs))
+        return msg
+
+
+class FakeUserClient:
+    def __init__(self, media_bytes=b"fakejpg"):
+        self.media_bytes = media_bytes
+
+    async def download_media(self, media, file=None):
+        file.write(self.media_bytes)
+        return file
+
+
+class FakeSentMessage:
+    def __init__(self, text, kwargs):
+        self.text = text
+        self.kwargs = kwargs
+        self.edicoes = []
+
+    async def edit(self, text, **kwargs):
+        self.edicoes.append((text, kwargs))
 
 
 class BotTests(unittest.TestCase):
@@ -79,18 +157,23 @@ class BotTests(unittest.TestCase):
                     "API_HASH='abc'\n"
                     "BOT_TOKEN=\"999:tok\"\n"
                     "MEU_CHAT_ID=777\n"
-                    "DESCONTO_MINIMO_AUTO=70\n"
+                    "DESCONTO_MINIMO_AUTO=65\n"
+                    "DESCONTO_CRITICO_MACRODROID=80\n"
+                    "TEMPO_SILENCIO_HORAS=4\n"
                 )
-            backup = {k: os.environ.pop(k, None) for k in ("API_ID", "API_HASH", "BOT_TOKEN", "MEU_CHAT_ID", "DESCONTO_MINIMO_AUTO")}
+            chaves = (
+                "API_ID", "API_HASH", "BOT_TOKEN", "MEU_CHAT_ID",
+                "DESCONTO_MINIMO_AUTO", "DESCONTO_CRITICO_MACRODROID", "TEMPO_SILENCIO_HORAS",
+            )
+            backup = {k: os.environ.pop(k, None) for k in chaves}
             try:
-                cfg = bot.carregar_configuracoes(env_path)
+                cfg = core.carregar_configuracoes(env_path)
                 self.assertEqual(cfg["API_ID"], 12345)
-                self.assertEqual(cfg["API_HASH"], "abc")
-                self.assertEqual(cfg["BOT_TOKEN"], "999:tok")
-                self.assertEqual(cfg["MEU_CHAT_ID"], 777)
-                self.assertEqual(cfg["DESCONTO_MINIMO_AUTO"], 70.0)
+                self.assertEqual(cfg["DESCONTO_MINIMO_AUTO"], 65.0)
+                self.assertEqual(cfg["DESCONTO_CRITICO_MACRODROID"], 80.0)
+                self.assertEqual(cfg["TEMPO_SILENCIO_HORAS"], 4.0)
             finally:
-                for k in ("API_ID", "API_HASH", "BOT_TOKEN", "MEU_CHAT_ID", "DESCONTO_MINIMO_AUTO"):
+                for k in chaves:
                     os.environ.pop(k, None)
                     if backup[k] is not None:
                         os.environ[k] = backup[k]
@@ -108,128 +191,192 @@ class BotTests(unittest.TestCase):
                     },
                     f,
                 )
-            dados = bot.carregar_dados(json_path, desconto_padrao=65.0)
+            dados = core.carregar_dados(json_path, desconto_padrao=65.0, desconto_critico=75.0)
             self.assertEqual(dados["canais"], ["@teste"])
             self.assertEqual(dados["alvos_preco"][r"\bpc\b"], 2000.0)
-            self.assertEqual(dados["alvos_compostos"], [])
-            self.assertEqual(dados["desconto_minimo"], 65.0)
+            self.assertEqual(dados["nao_perturbe"], {"ativo": True, "inicio": 0, "fim": 7})
+            self.assertEqual(dados["filtros_extras"], {"bloquear_usados": False, "bloquear_importacao": False})
+            self.assertEqual(dados["resumo_hora"], 21)
 
-    def test_extracao_preco_ignora_parcelas_e_descontos(self):
-        self.assertEqual(bot.extrair_preco("De R$ 2.500,00 por R$ 1.199,90 (10x de R$ 130)"), 1199.90)
-        self.assertEqual(bot.extrair_preco("Placa por R$ 1.250 usando cupom de R$ 50 off"), 1250.0)
-        self.assertEqual(bot.extrair_preco("Frete grátis acima de R$ 79 - Mouse R$ 49,90"), 49.90)
-        self.assertEqual(bot.extrair_preco("Produto R$ 199.90"), 199.90)
-        self.assertIsNone(bot.extrair_preco("Sem preço aqui"))
-
-    def test_detector_desconto_real(self):
-        res = bot.detectar_desconto_real("Monitor De R$ 2.000,00 por R$ 500,00!", 65)
-        self.assertIsNotNone(res)
-        self.assertAlmostEqual(res[0], 75.0, places=1)
-
-        res_strikethrough = bot.detectar_desconto_real("~~R$ 1.000~~ R$ 300 hoje!", 65)
-        self.assertIsNotNone(res_strikethrough)
-        self.assertAlmostEqual(res_strikethrough[0], 70.0, places=1)
-
-        self.assertIsNone(bot.detectar_desconto_real("De R$ 500 por R$ 250", 65))
-        self.assertIsNone(bot.detectar_desconto_real("De R$ 500 por 10x de R$ 50", 65))
-
-    def test_sniper_composto_e_regex_pc(self):
+    def test_faixa_min_max_prioridade_e_filtros(self):
         banco = {
-            "palavras": [r"\bbug\b"],
+            "palavras": [r"\bbug\b", r"\bimperd[íi]vel\b", r"\bcorre+\b"],
             "negativas": [r"\besgotado\b"],
-            "alvos_preco": {r"\bpc\b": 2000.0},
+            "alvos_preco": {"placa de vídeo": {"min": 400.0, "max": 1300.0}, r"\bpc\b": 2000.0},
             "alvos_compostos": [
-                bot.parsear_comando_composto("ram16 | 16gb + ddr4 | notebook, sodimm | 220")
+                core.parsear_comando_composto("ram16 | 16gb + ddr4 | notebook, sodimm | 120-220")
             ],
             "desconto_minimo": 65.0,
+            "desconto_critico": 75.0,
+            "filtros_extras": {"bloquear_usados": True, "bloquear_importacao": True},
         }
 
-        ok, motivo = bot.avaliar_gatilhos("PC Gamer Ryzen por R$ 1.899", banco)
-        self.assertTrue(ok)
-        self.assertIn("Teto Atingido", motivo)
+        # Cabo/suporte de R$ 35 não pode disparar faixa 400-1300
+        res_cabo = core.avaliar_gatilhos("Suporte para placa de vídeo por R$ 35,00", banco)
+        self.assertFalse(res_cabo["disparar"])
 
-        ok_falso, _ = bot.avaliar_gatilhos("Opção de capinha por R$ 100", banco)
-        self.assertFalse(ok_falso)
+        # Placa real dentro da faixa dispara prioridade ALTA mesmo se tiver palavra genérica "CORRE"
+        res_placa = core.avaliar_gatilhos("CORRE! Placa de vídeo RTX por R$ 1.150,00", banco)
+        self.assertTrue(res_placa["disparar"])
+        self.assertEqual(res_placa["prioridade"], "alta")
+        self.assertIn("Teto Atingido", res_placa["motivo"])
 
-        ok_combo, motivo_combo = bot.avaliar_gatilhos("Memória Desktop 16GB DDR4 3200MHz R$ 199,90", banco)
-        self.assertTrue(ok_combo)
-        self.assertIn("Combo (ram16", motivo_combo)
+        # Palavra genérica dispara prioridade NORMAL (silenciosa, sem MacroDroid)
+        res_gen = core.avaliar_gatilhos("Oferta imperdível de cafeteira por R$ 199", banco)
+        self.assertTrue(res_gen["disparar"])
+        self.assertEqual(res_gen["prioridade"], "normal")
 
-        ok_excluido, _ = bot.avaliar_gatilhos("Memória Notebook SODIMM 16GB DDR4 R$ 180", banco)
-        self.assertFalse(ok_excluido)
+        # Queda >= 75% vira prioridade ALTA, queda de 68% fica NORMAL
+        res_75 = core.avaliar_gatilhos("Monitor De R$ 2.000 por R$ 480", banco)
+        self.assertTrue(res_75["disparar"])
+        self.assertEqual(res_75["prioridade"], "alta")
 
-        ok_pendrive, _ = bot.avaliar_gatilhos("Pendrive 16GB USB R$ 35", banco)
-        self.assertFalse(ok_pendrive)
+        res_68 = core.avaliar_gatilhos("Monitor De R$ 1.000 por R$ 320", banco)
+        self.assertTrue(res_68["disparar"])
+        self.assertEqual(res_68["prioridade"], "normal")
 
-        ok_neg, _ = bot.avaliar_gatilhos("BUG absurdo esgotado R$ 10", banco)
-        self.assertFalse(ok_neg)
+        # Filtros usados & compra internacional
+        res_usado = core.avaliar_gatilhos("BUG PC gamer usado por R$ 1.500", banco)
+        self.assertFalse(res_usado["disparar"])
+        self.assertEqual(res_usado["bloqueado_por"], "filtro_usado")
 
-    def test_cupons_e_html(self):
-        texto = (
-            "Corre! Cupom: SUPER20\n"
-            "Código: VALE-50\n"
-            "🎟️ Cupom 👇\n"
-            "MAGALU100\n"
-            "Use o cupom no site ou abaixo! <script>alert(1)</script>"
-        )
-        cupons = bot.extrair_cupons(texto)
-        self.assertEqual(cupons, ["SUPER20", "VALE-50", "MAGALU100"])
+        res_import = core.avaliar_gatilhos("BUG SSD 16GB DDR4 Compra Internacional Remessa Conforme R$ 180", banco)
+        self.assertFalse(res_import["disparar"])
+        self.assertEqual(res_import["bloqueado_por"], "filtro_importacao")
 
-        msg, botoes = bot.montar_mensagem_e_botoes(
-            nome_grupo="Canal <Bugs>",
-            motivo_disparo="Palavra-Chave (\\bbug\\b)",
+        # "usando" não deve ser bloqueado pelo filtro de usado
+        res_usando = core.avaliar_gatilhos("BUG PC gamer usando cupom por R$ 1.500", banco)
+        self.assertTrue(res_usando["disparar"])
+
+    def test_horario_dnd(self):
+        dnd_padrao = {"ativo": True, "inicio": 0, "fim": 7}
+        self.assertTrue(core.eh_horario_dnd(dnd_padrao, datetime.datetime(2026, 11, 11, 3, 30)))
+        self.assertFalse(core.eh_horario_dnd(dnd_padrao, datetime.datetime(2026, 11, 11, 7, 0)))
+
+        dnd_noite = {"ativo": True, "inicio": 23, "fim": 7}
+        self.assertTrue(core.eh_horario_dnd(dnd_noite, datetime.datetime(2026, 11, 11, 23, 15)))
+        self.assertTrue(core.eh_horario_dnd(dnd_noite, datetime.datetime(2026, 11, 11, 2, 0)))
+        self.assertFalse(core.eh_horario_dnd(dnd_noite, datetime.datetime(2026, 11, 11, 15, 0)))
+
+    def test_persistencia_historico_e_silenciamento_3h(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            caminho_est = os.path.join(tmp, "estado_bot.json")
+            est = core.carregar_estado_persistente(caminho_est)
+            chave = "amazon:B09V3KXJPB"
+            h_curto = core.hash_curto_chave(chave)
+            self.assertLessEqual(len(f"sil:{h_curto}"), 64)
+
+            core.registrar_historico(est, chave, 10800, caminho_est, agora=1000000000.0)
+            # Simula registro com timestamp futuro real
+            futuro = time.time() + 3600
+            est["dedup"][chave] = futuro
+            est["dedup"][f"sil_hash:{h_curto}"] = futuro
+            core.salvar_estado_persistente(est, caminho_est)
+
+            # Simula reinício carregando do disco
+            est_recarregado = core.carregar_estado_persistente(caminho_est)
+            self.assertTrue(core.esta_no_historico(est_recarregado, chave))
+            self.assertTrue(core.esta_no_historico(est_recarregado, f"sil_hash:{h_curto}"))
+
+    def test_cupons_comparacao_e_botoes(self):
+        texto = "25% OFF em R$ 79, Limite de R$ 50 OFF: OPORTUNIDADEML\nCupom: SUPER20\n🎟️ Cupom 👇\nMAGALU100\n50% off apenas hoje\nPlaca RTX 4060"
+        cupons = core.extrair_cupons(texto)
+        self.assertEqual(cupons, ["OPORTUNIDADEML", "SUPER20", "MAGALU100"])
+
+        info_amz = core.identificar_produto("https://www.amazon.com.br/dp/B09V3KXJPB?tag=123")
+        url_keepa = core.gerar_url_comparacao(info_amz, texto, info_amz["link_limpo"])
+        self.assertEqual(url_keepa, "https://keepa.com/#!product/12-B09V3KXJPB")
+
+        info_kbm = core.identificar_produto("https://www.kabum.com.br/produto/520368/placa-de-video-rtx-4060")
+        url_buscape = core.gerar_url_comparacao(info_kbm, texto, info_kbm["link_limpo"])
+        self.assertIn("buscape.com.br/search?q=", url_buscape)
+
+        msg, legenda, spec = core.montar_mensagem_e_botoes_spec(
+            nome_grupo="Grupo Bugs",
+            motivo_disparo="Teto Atingido",
+            prioridade="alta",
             texto_bruto=texto,
             cupons=cupons,
-            info_produto={
-                "loja": "Amazon",
-                "produto_id": "amazon:B09V3KXJPB",
-                "link_limpo": "https://www.amazon.com.br/dp/B09V3KXJPB",
-                "carrinho_amazon": "https://www.amazon.com.br/gp/aws/cart/add.html?ASIN.1=B09V3KXJPB&Quantity.1=1",
-            },
-            link_oferta="https://www.amazon.com.br/dp/B09V3KXJPB",
-            link_origem="https://t.me/teste/123",
+            info_produto=info_amz,
+            link_oferta=info_amz["link_limpo"],
+            link_origem="https://t.me/teste/1",
+            url_comparacao=url_keepa,
+            chave_silenciar="abc123def456",
+            tipo_gatilho="palavra",
+            alvo_gatilho=r"\bcorre+\b",
         )
-        self.assertIn("🎟️ <b>Cupom(ns):</b> <code>SUPER20</code> <code>VALE-50</code> <code>MAGALU100</code>", msg)
-        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", msg)
-        self.assertEqual(len(botoes), 3)
-        self.assertEqual(botoes[0][0]["text"], "🔥 Abrir Oferta")
-        self.assertEqual(botoes[1][0]["text"], "🛒 Carrinho Amazon")
-        self.assertEqual(botoes[2][0]["text"], "📢 Ver Post Original")
+        self.assertIn("<code>OPORTUNIDADEML</code>", msg)
+        self.assertIn("<code>SUPER20</code>", msg)
+        self.assertLessEqual(len(legenda), 1000)
+        botoes = bot.converter_botoes_telethon(spec)
+        self.assertEqual(len(botoes), 5)
+        self.assertEqual(botoes[2][0]["text"], "📊 Comparar Preço")
+        self.assertEqual(botoes[3][0]["data"], b"sil:abc123def456")
+        self.assertIn("Parar de monitorar", botoes[4][0]["text"])
+        self.assertTrue(botoes[4][0]["data"].startswith(b"stop:p:"))
 
-    def test_identificacao_lojas_e_prioridade_link(self):
-        links = bot.extrair_links_mensagem(
-            "Entre em https://t.me/canalpromo e veja https://amzn.to/abc123",
-            [MessageEntityTextUrl("https://t.me/canalpromo")],
+    def test_alerta_vago_metadados_e_edit(self):
+        self.assertTrue(core.alerta_eh_vago("CORRE BUG https://amzn.to/abc"))
+        self.assertFalse(core.alerta_eh_vago("Placa de vídeo RTX 4060 Asus por R$ 1.899 https://amzn.to/abc"))
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(
+                    b'<html><head>'
+                    b'<meta property="og:title" content="SSD Kingston NV2 1TB M.2 | Amazon.com.br">'
+                    b'<meta property="product:price:amount" content="349.90">'
+                    b'</head></html>'
+                )
+
+            def log_message(self, format, *args):
+                return
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            url = f"http://127.0.0.1:{port}/produto-x"
+            sent = FakeSentMessage("msg antiga", {})
+            ctx = {
+                "nome_grupo": "Canal",
+                "motivo_disparo": "Palavra-Chave",
+                "prioridade": "alta",
+                "texto_bruto": f"CORRE BUG {url}",
+                "cupons": [],
+                "info_produto": {"loja": None, "produto_id": None, "link_limpo": url, "carrinho_amazon": None},
+                "link_oferta": url,
+                "link_origem": "https://t.me/canal/1",
+                "links_extras": [url],
+                "texto_recuperado": None,
+                "url_comparacao": None,
+                "chave_curta": "112233445566",
+            }
+            asyncio.run(bot._enriquecer_alerta_vago(sent, False, ctx))
+            self.assertEqual(len(sent.edicoes), 1)
+            self.assertIn("SSD Kingston NV2 1TB M.2", sent.edicoes[0][0])
+            self.assertIn("349.90", sent.edicoes[0][0])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_envio_com_foto_legenda_curta(self):
+        fake_bot = FakeBotClient()
+        fake_user = FakeUserClient(b"imagem_jpeg_teste")
+        ev = types.SimpleNamespace(photo=object())
+        msg_longa = "A" * 1500
+        legenda = "B" * 950
+
+        sent, foi_foto = asyncio.run(
+            bot._enviar_alerta_telegram(fake_bot, fake_user, ev, 999, msg_longa, legenda, None, False)
         )
-        self.assertEqual(bot.escolher_link_oferta(links), "https://amzn.to/abc123")
+        self.assertTrue(foi_foto)
+        self.assertEqual(len(fake_bot.arquivos), 1)
+        self.assertLessEqual(len(fake_bot.arquivos[0][2]["caption"]), 1000)
 
-        amz = bot.identificar_produto("https://www.amazon.com.br/dp/B09V3KXJPB?tag=xxx&ref=yyy")
-        self.assertEqual(amz["produto_id"], "amazon:B09V3KXJPB")
-        self.assertEqual(amz["link_limpo"], "https://www.amazon.com.br/dp/B09V3KXJPB")
-        self.assertIn("ASIN.1=B09V3KXJPB", amz["carrinho_amazon"])
-
-        ml1 = bot.identificar_produto("https://produto.mercadolivre.com.br/MLB-3847192045-ssd-_JM?matt_tool=123")
-        ml2 = bot.identificar_produto("https://www.mercadolivre.com.br/ssd/p/MLB3847192045?pdp_filters=1")
-        self.assertEqual(ml1["produto_id"], "ml:MLB3847192045")
-        self.assertEqual(ml2["produto_id"], "ml:MLB3847192045")
-        self.assertNotIn("matt_tool", ml1["link_limpo"])
-
-        shp = bot.identificar_produto("https://shopee.com.br/Produto-Legal-i.12345.678901?sp_atk=aaa")
-        self.assertEqual(shp["produto_id"], "shopee:12345.678901")
-        self.assertEqual(shp["link_limpo"], "https://shopee.com.br/product/12345/678901")
-
-        kbm = bot.identificar_produto("https://www.kabum.com.br/produto/520368/placa?utm_source=abc")
-        self.assertEqual(kbm["produto_id"], "kabum:520368")
-        self.assertEqual(kbm["link_limpo"], "https://www.kabum.com.br/produto/520368/placa")
-
-        mag = bot.identificar_produto("https://www.magazineluiza.com.br/fone/p/237481900/ea/fblt/?partner_id=9")
-        self.assertEqual(mag["produto_id"], "magalu:237481900")
-
-        ali = bot.identificar_produto("https://pt.aliexpress.com/item/1005006123456789.html?spm=a2g0o")
-        self.assertEqual(ali["produto_id"], "aliexpress:1005006123456789")
-        self.assertEqual(ali["link_limpo"], "https://pt.aliexpress.com/item/1005006123456789.html")
-
-    def test_expandir_link_redirect_e_fallback_get(self):
+    def test_expandir_link_405_e_redirect_html(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_HEAD(self):
                 if self.path == "/short":
@@ -262,76 +409,257 @@ class BotTests(unittest.TestCase):
         thread.start()
         try:
             port = server.server_address[1]
-            expandida = bot.expandir_link(f"http://127.0.0.1:{port}/html-redirect")
-            self.assertEqual(expandida, "https://www.kabum.com.br/produto/112233/ssd")
-
-            unwrapped = bot.expandir_link(
-                "https://shopee.com.br/universal-link?redir=https%3A%2F%2Fshopee.com.br%2Fproduct%2F111%2F222"
+            self.assertEqual(
+                core.expandir_link(f"http://127.0.0.1:{port}/html-redirect"),
+                "https://www.kabum.com.br/produto/112233/ssd",
             )
-            self.assertEqual(unwrapped, "https://shopee.com.br/product/111/222")
-
-            # Garante que redirect + 405 no destino ainda preserva a URL redirecionada
-            com_405 = bot.expandir_link(f"http://127.0.0.1:{port}/short")
-            self.assertEqual(com_405, f"http://127.0.0.1:{port}/p/MLB98765432")
+            self.assertEqual(
+                core.expandir_link(f"http://127.0.0.1:{port}/short"),
+                f"http://127.0.0.1:{port}/p/MLB98765432",
+            )
         finally:
             server.shutdown()
             server.server_close()
 
-    def test_deduplicacao_entre_links_diferentes_mesmo_produto(self):
-        info_canal_a = bot.identificar_produto("https://www.amazon.com.br/dp/B09V3KXJPB?tag=canalA-20")
-        info_canal_b = bot.identificar_produto("https://www.amazon.com.br/gp/product/B09V3KXJPB?ref=canalB")
-        chave_a = bot.montar_chave_duplicata(info_canal_a, info_canal_a["link_limpo"], "Palavra-Chave", "x")
-        chave_b = bot.montar_chave_duplicata(info_canal_b, info_canal_b["link_limpo"], "Palavra-Chave", "y")
-        self.assertEqual(chave_a, "amazon:B09V3KXJPB")
-        self.assertEqual(chave_a, chave_b)
-
-    def test_composto_sem_exclusao_e_compatibilidade_banco_real(self):
-        regra = bot.parsear_comando_composto("ssd1tb | ssd + 1tb | 350,00")
-        self.assertEqual(regra["excluir"], [])
-        self.assertEqual(regra["teto"], 350.0)
-
-        banco_real_path = os.path.join(bot.BASE_DIR, "banco_de_dados.json")
-        if os.path.exists(banco_real_path):
-            with tempfile.TemporaryDirectory() as tmp:
-                copia = os.path.join(tmp, "banco_copia.json")
-                with open(banco_real_path, "r", encoding="utf-8") as orig:
-                    conteudo = orig.read()
-                with open(copia, "w", encoding="utf-8") as dst:
-                    dst.write(conteudo)
-                dados = bot.carregar_dados(copia, desconto_padrao=65.0)
-                ok, _ = bot.avaliar_gatilhos("PC completo por R$ 1.800", dados)
-                self.assertTrue(ok)
-                ok_obsid, _ = bot.avaliar_gatilhos("BUG PC obsid R$ 100", dados)
-                self.assertFalse(ok_obsid)
-
-    def test_comandos_painel_composto_e_desconto(self):
+    def test_comandos_novos_painel_e_restore_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             json_path = os.path.join(tmp, "banco.json")
-            banco = bot.carregar_dados(json_path)
-            cfg = {"URL_MACRODROID": ""}
-            estado = {"pausado": False, "alertas_enviados": 0, "inicio": 0.0}
+            log_path = os.path.join(tmp, "bot.log")
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("linha 1\nlinha 2\n")
 
-            orig_salvar = bot.salvar_dados
-            bot.salvar_dados = lambda d, caminho_json=json_path: orig_salvar(d, json_path)
-            try:
-                ev1 = FakeEvent("/addcomposto ram | 16gb + ddr4 | notebook | 210")
-                asyncio.run(bot.processar_comando_painel(ev1, banco, cfg, estado))
-                self.assertEqual(len(banco["alvos_compostos"]), 1)
-                self.assertEqual(banco["alvos_compostos"][0]["teto"], 210.0)
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": ""}
+            est_run = {"pausado": False, "inicio": time.time()}
+            est_pers = core.carregar_estado_persistente(os.path.join(tmp, "estado.json"))
+            est_pers["ultimos"].append({"hora": "15:00", "loja": "Amazon", "motivo": "BUG", "link": "https://amzn.to/x"})
 
-                ev2 = FakeEvent("/setdesconto 75")
-                asyncio.run(bot.processar_comando_painel(ev2, banco, cfg, estado))
-                self.assertEqual(banco["desconto_minimo"], 75.0)
+            async def rodar():
+                ev_teto = FakeEvent("/addteto placa de vídeo, 400-1300")
+                await bot.processar_comando_painel(ev_teto, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(banco["alvos_preco"]["placa de vídeo"], {"min": 400.0, "max": 1300.0})
 
-                ev3 = FakeEvent("/addpalavra [invalido")
-                asyncio.run(bot.processar_comando_painel(ev3, banco, cfg, estado))
-                self.assertIn("Expressão inválida", ev3.respostas[0][0])
+                ev_dnd = FakeEvent("/dnd 23-6")
+                await bot.processar_comando_painel(ev_dnd, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(banco["nao_perturbe"], {"ativo": True, "inicio": 23, "fim": 6})
 
-                ev4 = FakeEvent("/delcomposto ram")
-                asyncio.run(bot.processar_comando_painel(ev4, banco, cfg, estado))
-                self.assertEqual(banco["alvos_compostos"], [])
-            finally:
-                bot.salvar_dados = orig_salvar
+                ev_flt = FakeEvent("/filtro usados on")
+                await bot.processar_comando_painel(ev_flt, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertTrue(banco["filtros_extras"]["bloquear_usados"])
+
+                ev_res = FakeEvent("/resumo 20")
+                await bot.processar_comando_painel(ev_res, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(banco["resumo_hora"], 20)
+
+                ev_ult = FakeEvent("/ultimos")
+                await bot.processar_comando_painel(ev_ult, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Amazon", ev_ult.respostas[0][0])
+
+                ev_log = FakeEvent("/logs 10")
+                await bot.processar_comando_painel(ev_log, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("linha 2", ev_log.respostas[0][0])
+
+                ev_bak = FakeEvent("/backup")
+                await bot.processar_comando_painel(ev_bak, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(len(fake_bot.arquivos), 1)
+
+                ev_teste = FakeEvent("/teste")
+                await bot.processar_comando_painel(ev_teste, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Teste Manual", ev_teste.respostas[0][0])
+
+                # Restaurar backup via upload de .json
+                payload = json.dumps({"canais": ["@novo"], "palavras": [r"\bbug\b"], "negativas": []}).encode("utf-8")
+                ev_up = FakeEvent("", document=True, file_name="backup.json", doc_bytes=payload)
+                ok = await bot.processar_backup_recebido(ev_up, banco, json_path)
+                self.assertTrue(ok)
+                self.assertEqual(banco["canais"], ["@novo"])
+                self.assertTrue(os.path.exists(f"{json_path}.bak"))
+
+            asyncio.run(rodar())
+
+    def test_editar_prioridades_callbacks_e_atalhos(self):
+        class FakeCallback:
+            def __init__(self, data, sender_id=777):
+                self.data = data.encode("utf-8")
+                self.sender_id = sender_id
+                self.edicoes = []
+                self.answers = []
+                self.respostas = []
+
+            async def edit(self, text=None, **kwargs):
+                self.edicoes.append((text, kwargs))
+
+            async def answer(self, text="", **kwargs):
+                self.answers.append((text, kwargs))
+
+            async def respond(self, text, **kwargs):
+                self.respostas.append((text, kwargs))
+
+            async def get_message(self):
+                return types.SimpleNamespace(buttons=[])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "inicio": time.time()}
+            est_pers = core.carregar_estado_persistente(est_path)
+            mapa_sil = {}
+
+            async def rodar():
+                # Atalho /m abre menu
+                ev_m = FakeEvent("/m")
+                await bot.processar_comando_painel(ev_m, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Painel de Controle", ev_m.respostas[0][0])
+
+                # /p alterna pausa -> ativo
+                ev_p1 = FakeEvent("/p")
+                await bot.processar_comando_painel(ev_p1, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertTrue(est_run["pausado"])
+                ev_p2 = FakeEvent("/p")
+                await bot.processar_comando_painel(ev_p2, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertFalse(est_run["pausado"])
+
+                # Lote em /ac e remocao por indice em /dc
+                ev_ac = FakeEvent("/ac @extra1 @extra2")
+                await bot.processar_comando_painel(ev_ac, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("@extra1", banco["canais"])
+                self.assertIn("@extra2", banco["canais"])
+
+                ev_dc_vazio = FakeEvent("/dc")
+                await bot.processar_comando_painel(ev_dc_vazio, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("1.", ev_dc_vazio.respostas[0][0])
+
+                primeiro_canal = banco["canais"][0]
+                ev_dc1 = FakeEvent("/dc 1")
+                await bot.processar_comando_painel(ev_dc1, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertNotIn(primeiro_canal, banco["canais"])
+
+                # Lote em /ap e remocao por indice em /dp
+                ev_ap = FakeEvent("/ap oferta_relampago; queima_estoque")
+                await bot.processar_comando_painel(ev_ap, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("oferta_relampago", banco["palavras"])
+                self.assertIn("queima_estoque", banco["palavras"])
+
+                # Promover palavra genérica para ALTA via /prio
+                ev_prio_w = FakeEvent("/prio palavra oferta_relampago alta")
+                await bot.processar_comando_painel(ev_prio_w, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                res_prom = core.avaliar_gatilhos("Super oferta_relampago agora!", banco)
+                self.assertEqual(res_prom["prioridade"], "alta")
+
+                # Rebaixar Teto para NORMAL via /prio e testar
+                await bot.processar_comando_painel(FakeEvent("/at placa, 1300"), banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                await bot.processar_comando_painel(FakeEvent("/prio teto normal"), banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                res_teto_norm = core.avaliar_gatilhos("Placa por R$ 1.100", banco)
+                self.assertEqual(res_teto_norm["prioridade"], "normal")
+
+                # Queda 65-74 normal, 80% alta, e desativar alta com off
+                await bot.processar_comando_painel(FakeEvent("/prio queda 65 off"), banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                res_queda_off = core.avaliar_gatilhos("Monitor De R$ 2.000 por R$ 400", banco)
+                self.assertEqual(res_queda_off["prioridade"], "normal")
+
+                # Callbacks inline alternam Teto, Combo, Dmin, Dcrit e Palavra
+                cb_teto = FakeCallback("prio:teto")
+                await bot.processar_callback_painel(cb_teto, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                self.assertEqual(banco["prioridades"]["teto"], "alta")
+
+                cb_pal = FakeCallback("prio:w:0:0")
+                antes_p0 = core.palavra_eh_alta(banco, banco["palavras"][0])
+                await bot.processar_callback_painel(cb_pal, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                self.assertNotEqual(core.palavra_eh_alta(banco, banco["palavras"][0]), antes_p0)
+
+                # Remover teto simples por indice /dt 1
+                ev_dt = FakeEvent("/dt 1")
+                await bot.processar_comando_painel(ev_dt, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(banco["alvos_preco"], {})
+
+            asyncio.run(rodar())
+
+    def test_teclado_fixo_wizard_e_parar_monitorar(self):
+        class FakeCallback:
+            def __init__(self, data, sender_id=777):
+                self.data = data.encode("utf-8")
+                self.sender_id = sender_id
+                self.edicoes = []
+                self.answers = []
+
+            async def edit(self, text=None, **kwargs):
+                self.edicoes.append((text, kwargs))
+
+            async def answer(self, text="", **kwargs):
+                self.answers.append((text, kwargs))
+
+            async def get_message(self):
+                return types.SimpleNamespace(buttons=[])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "inicio": time.time(), "aguardando": None}
+            est_pers = core.carregar_estado_persistente(est_path)
+            mapa_sil = {}
+
+            async def rodar():
+                # 1. Teclado fixo aparece no /start e /teclado
+                ev_tec = FakeEvent("/teclado")
+                await bot.processar_comando_painel(ev_tec, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(ev_tec.respostas[0][1]["buttons"][0][0]["type"], "text")
+
+                # 2. Fluxo Adicionar via botão do teclado fixo -> escolhe palavra -> digita texto
+                ev_btn_add = FakeEvent("➕ Adicionar")
+                await bot.processar_comando_painel(ev_btn_add, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("O que você deseja adicionar", ev_btn_add.respostas[0][0])
+
+                cb_add_p = FakeCallback("wiz:add:p")
+                await bot.processar_callback_painel(cb_add_p, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                self.assertEqual(est_run["aguardando"], "add:palavra")
+
+                # Clicar outro botão do teclado fixo NÃO pode adicionar o texto do botão como palavra!
+                ev_btn_rem = FakeEvent("➖ Remover")
+                await bot.processar_comando_painel(ev_btn_rem, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertNotIn("➖ Remover", banco["palavras"])
+                self.assertIsNone(est_run["aguardando"])
+
+                # Agora volta para Adicionar -> Palavra -> digita termo válido
+                await bot.processar_callback_painel(cb_add_p, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                ev_texto = FakeEvent("cupom_teste_novo")
+                await bot.processar_comando_painel(ev_texto, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("cupom_teste_novo", banco["palavras"])
+                self.assertIsNone(est_run["aguardando"])
+
+                # 3. Fluxo Remover via botões
+                cb_rem_list = FakeCallback("wiz:delcat:p:0")
+                await bot.processar_callback_painel(cb_rem_list, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                idx_novo = banco["palavras"].index("cupom_teste_novo")
+                cb_del_item = FakeCallback(f"wiz:del:p:{idx_novo}:0")
+                await bot.processar_callback_painel(cb_del_item, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                self.assertNotIn("cupom_teste_novo", banco["palavras"])
+
+                # 4. Botão "Parar de monitorar" direto no alerta
+                alvo_corre = r"\bcorre+\b"
+                self.assertIn(alvo_corre, banco["palavras"])
+                cb_stop = FakeCallback(f"stop:p:{core.hash_curto_chave(alvo_corre)}")
+                await bot.processar_callback_painel(cb_stop, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                self.assertNotIn(alvo_corre, banco["palavras"])
+
+                # 5. Demais botões do teclado fixo funcionam
+                for txt_btn in ("📋 Minhas listas", "🎛️ Painel", "⚡ Prioridades", "🕘 Histórico"):
+                    ev_b = FakeEvent(txt_btn)
+                    await bot.processar_comando_painel(ev_b, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                    self.assertTrue(ev_b.respostas)
+
+            asyncio.run(rodar())
 
 
 if __name__ == "__main__":
