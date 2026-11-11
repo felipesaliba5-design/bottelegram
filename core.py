@@ -1,7 +1,9 @@
 import copy
 import datetime
+import functools
 import hashlib
 import html
+import http.client
 import ipaddress
 import json
 import logging
@@ -15,6 +17,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from logging.handlers import RotatingFileHandler
+
+try:
+    import regex as _regex_timeout
+except ImportError:
+    _regex_timeout = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ARQUIVO_ENV = os.path.join(BASE_DIR, ".env")
@@ -260,6 +267,7 @@ def _salvar_json_atomico(dados, caminho_json):
                 caminho_tmp = f.name
                 json.dump(dados, f, ensure_ascii=False, indent=4)
                 f.flush()
+                os.fsync(f.fileno())
             os.replace(caminho_tmp, caminho_json)
         except Exception:
             if caminho_tmp and os.path.exists(caminho_tmp):
@@ -445,19 +453,74 @@ def hash_curto_chave(chave):
     return hashlib.sha1(chave.encode("utf-8")).hexdigest()[:12]
 
 
+def regex_eh_perigosa(padrao):
+    """Detecta quantificadores aninhados propensos a catastrophic backtracking (ReDoS)."""
+    if not isinstance(padrao, str) or not padrao:
+        return False
+    return bool(
+        re.search(
+            r"\((?:[^()\\]|\\.)*(?:[+*]|\{\d+,\d*\})(?:[^()\\]|\\.)*\)\s*(?:[+*]|\{\d+,\d*\})",
+            padrao,
+        )
+    )
+
+
+def regex_generica_demais(padrao):
+    """Rejeita padrões que casariam com praticamente toda mensagem (ex.: '.', '.*', '\\w', 'a')."""
+    p = (padrao or "").strip()
+    if len(p) < 2:
+        return True
+    try:
+        return (
+            bool(re.search(p, "", re.IGNORECASE))
+            or all(re.search(p, s, re.IGNORECASE) for s in ("a", "1"))
+            or bool(re.fullmatch(p, " "))
+        )
+    except re.error:
+        return False
+
+
 def regex_valida(padrao):
-    """Valida se uma expressão regular compila sem erro."""
+    """Valida se uma expressão regular compila sem erro e sem risco óbvio de ReDoS."""
     try:
         re.compile(padrao, re.IGNORECASE)
-        return True, None
     except re.error as err:
         return False, str(err)
+    if regex_eh_perigosa(padrao):
+        return False, "quantificador aninhado com risco de travamento (ReDoS)"
+    return True, None
+
+
+@functools.lru_cache(maxsize=512)
+def _compilar_regex(padrao):
+    return re.compile(padrao, re.IGNORECASE)
 
 
 def match_padrao(padrao, texto):
-    """Busca por regex (ou literal se a regex for inválida) ignorando maiúsculas."""
+    """Busca por regex (com proteção contra ReDoS) ou literal se a regex for inválida."""
+    if not isinstance(padrao, str) or not isinstance(texto, str):
+        return False
+    if _regex_timeout is not None:
+        try:
+            return (
+                _regex_timeout.search(
+                    padrao,
+                    texto,
+                    flags=_regex_timeout.IGNORECASE,
+                    timeout=0.05,
+                )
+                is not None
+            )
+        except TimeoutError:
+            logger.warning("Regex excedeu 50ms e foi ignorada: %r", padrao[:80])
+            return False
+        except (_regex_timeout.error, TypeError):
+            return padrao.lower() in texto.lower()
+    if regex_eh_perigosa(padrao):
+        logger.warning("Regex com risco de backtracking ignorada: %r", padrao[:80])
+        return False
     try:
-        return re.search(padrao, texto, re.IGNORECASE) is not None
+        return _compilar_regex(padrao).search(texto) is not None
     except re.error:
         return padrao.lower() in texto.lower()
 
@@ -982,6 +1045,47 @@ def _url_bloqueio_ou_login(url):
     )
 
 
+def _ip_eh_publico(ip_str):
+    """Retorna True só se ip_str é um IP globalmente roteável (nem loopback/privado/link-local)."""
+    ip = ipaddress.ip_address(ip_str)
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return (
+        ip.is_global
+        and not ip.is_private
+        and not ip.is_loopback
+        and not ip.is_link_local
+        and not ip.is_multicast
+        and not ip.is_reserved
+        and not ip.is_unspecified
+    )
+
+
+def _resolver_ip_publico_host(host, porta):
+    """Resolve DNS uma única vez, exige todos IPs públicos e devolve um IP fixo para conectar."""
+    host_limpo = (host or "").strip("[]")
+    if not host_limpo:
+        raise urllib.error.URLError("Host vazio bloqueado")
+    try:
+        infos = socket.getaddrinfo(host_limpo, porta, proto=socket.IPPROTO_TCP)
+    except (ValueError, OSError) as err:
+        raise urllib.error.URLError(f"Falha ao resolver {host_limpo}: {err}") from err
+    enderecos = []
+    for info in infos:
+        ip_str = info[4][0].split("%")[0]
+        if ip_str not in enderecos:
+            enderecos.append(ip_str)
+    if not enderecos:
+        raise urllib.error.URLError(f"Sem endereços para {host_limpo}")
+    for ip_str in enderecos:
+        try:
+            ok = _ip_eh_publico(ip_str)
+        except ValueError as err:
+            raise urllib.error.URLError(f"IP inválido para {host_limpo}: {ip_str}") from err
+        if not ok:
+            raise urllib.error.URLError(f"Destino não público bloqueado: {host_limpo} -> {ip_str}")
+    return enderecos[0]
+
+
 def url_destino_publico(url):
     """Anti-SSRF: True só se a URL é http(s) e TODOS os IPs do host são públicos."""
     if PERMITIR_REDE_LOCAL:
@@ -992,26 +1096,41 @@ def url_destino_publico(url):
         if esquema not in ("http", "https") or not parsed.hostname:
             return False
         porta = parsed.port or (443 if esquema == "https" else 80)
-        infos = socket.getaddrinfo(parsed.hostname, porta, proto=socket.IPPROTO_TCP)
-        enderecos = {info[4][0].split("%")[0] for info in infos}
-        if not enderecos:
-            return False
-        for ip_str in enderecos:
-            ip = ipaddress.ip_address(ip_str)
-            ip = getattr(ip, "ipv4_mapped", None) or ip
-            if (
-                not ip.is_global
-                or ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-                or ip.is_unspecified
-            ):
-                return False
+        _resolver_ip_publico_host(parsed.hostname, porta)
         return True
-    except (ValueError, OSError):
+    except (ValueError, OSError, urllib.error.URLError):
         return False
+
+
+class _PinnedConnectionMixin:
+    """Fixa na conexão TCP o mesmo IP validado no DNS, evitando DNS rebinding."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = self._conectar_com_ip_fixado
+
+    def _conectar_com_ip_fixado(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        host, port = address
+        ip_alvo = host if PERMITIR_REDE_LOCAL else _resolver_ip_publico_host(host, port)
+        return socket.create_connection((ip_alvo, port), timeout, source_address)
+
+
+class _PinnedHTTPConnection(_PinnedConnectionMixin, http.client.HTTPConnection):
+    pass
+
+
+class _PinnedHTTPSConnection(_PinnedConnectionMixin, http.client.HTTPSConnection):
+    pass
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PinnedHTTPConnection, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
 
 
 class _RedirecionamentoSeguro(urllib.request.HTTPRedirectHandler):
@@ -1024,17 +1143,27 @@ class _RedirecionamentoSeguro(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_OPENER_SEGURO = urllib.request.build_opener(_RedirecionamentoSeguro)
+_OPENER_SEGURO = urllib.request.build_opener(
+    _RedirecionamentoSeguro, _PinnedHTTPHandler, _PinnedHTTPSHandler
+)
 
 
 def _abrir_url_segura(req, timeout):
-    """Substitui urllib.request.urlopen para links vindos de canais (não confiáveis)."""
-    if not url_destino_publico(req.full_url):
-        raise urllib.error.URLError(f"Destino não público bloqueado: {req.full_url}")
+    """Abre destinos http(s) públicos com IP validado e fixado na conexão TCP (anti-SSRF/rebinding)."""
+    if not PERMITIR_REDE_LOCAL:
+        parsed = urllib.parse.urlparse(req.full_url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            raise urllib.error.URLError(f"Destino não público bloqueado: {req.full_url}")
     return _OPENER_SEGURO.open(req, timeout=timeout)
 
 
-def expandir_link(url, timeout=4):
+_CACHE_EXPANSAO = {}
+_CACHE_EXPANSAO_LOCK = threading.Lock()
+_TTL_CACHE_EXPANSAO = 600
+_MAX_CACHE_EXPANSAO = 500
+
+
+def _expandir_link_rede(url, timeout=4):
     """Expande encurtadores (Amazon, ML, Shopee, Magalu, Kabum, AliExpress) seguindo redirects."""
     url_inicial = _desembrulhar_query_redirect(url)
     host = urllib.parse.urlparse(url_inicial).netloc.lower()
@@ -1087,6 +1216,30 @@ def expandir_link(url, timeout=4):
                 continue
             break
 
+    return url_final
+
+
+def expandir_link(url, timeout=4):
+    """Evita rede quando o link já traz o ID do produto e reaproveita expansões recentes."""
+    url_inicial = _desembrulhar_query_redirect(url)
+    if identificar_produto(url_inicial)["produto_id"]:
+        return url_inicial
+
+    agora = time.time()
+    with _CACHE_EXPANSAO_LOCK:
+        em_cache = _CACHE_EXPANSAO.get(url_inicial)
+        if em_cache and em_cache[1] > agora:
+            return em_cache[0]
+
+    url_final = _expandir_link_rede(url_inicial, timeout)
+
+    if url_final != url_inicial:
+        with _CACHE_EXPANSAO_LOCK:
+            if len(_CACHE_EXPANSAO) >= _MAX_CACHE_EXPANSAO:
+                vencidas = [k for k, v in _CACHE_EXPANSAO.items() if v[1] <= agora]
+                for k in vencidas or [next(iter(_CACHE_EXPANSAO))]:
+                    _CACHE_EXPANSAO.pop(k, None)
+            _CACHE_EXPANSAO[url_inicial] = (url_final, agora + _TTL_CACHE_EXPANSAO)
     return url_final
 
 
@@ -1425,7 +1578,11 @@ def montar_mensagem_e_botoes_spec(
         botoes_spec.append(linha_apoio)
 
     if chave_silenciar:
-        botoes_spec.append([("inline", "🤫 Silenciar 3h", f"sil:{chave_silenciar}")])
+        linha_silencio = [("inline", "🤫 Silenciar 3h", f"sil:{chave_silenciar}")]
+        loja_nome = ((info_produto or {}).get("loja") or "").strip()
+        if loja_nome:
+            linha_silencio.append(("inline", f"😴 {loja_nome} 1h", f"snz:{loja_nome.lower()}"))
+        botoes_spec.append(linha_silencio)
     if tipo_gatilho in ("palavra", "teto", "combo") and alvo_gatilho:
         codigo_tipo = tipo_gatilho[0]
         botoes_spec.append(

@@ -4,6 +4,7 @@ import difflib
 import html
 import io
 import json
+import math
 import os
 import re
 import time
@@ -63,6 +64,7 @@ from core import (
     palavra_eh_alta,
     parsear_comando_composto,
     parsear_faixa_preco,
+    regex_generica_demais,
     regex_valida,
     registrar_alerta_enviado,
     registrar_historico,
@@ -177,19 +179,33 @@ def converter_botoes_telethon(botoes_spec):
 
 
 async def enviar_em_partes_fn(send_fn, texto, parse_mode="html"):
-    """Envia mensagens longas dividindo por linhas para respeitar o limite do Telegram."""
+    """Divide mensagens longas sem enviar blocos vazios nem estourar o limite por linha."""
+    limite = 3900
     if len(texto) <= 4000:
         await send_fn(texto, parse_mode=parse_mode)
         return
 
+    linhas = texto.splitlines(keepends=True)
+    modo = parse_mode
+    if any(len(linha) > limite for linha in linhas):
+        texto = html.unescape(re.sub(r"<[^>]*>", "", texto))
+        linhas = texto.splitlines(keepends=True)
+        modo = None
+
     bloco = ""
-    for linha in texto.splitlines(keepends=True):
-        if len(bloco) + len(linha) > 3900:
-            await send_fn(bloco, parse_mode=parse_mode)
+    for linha in linhas:
+        while len(linha) > limite:
+            if bloco:
+                await send_fn(bloco, parse_mode=modo)
+                bloco = ""
+            await send_fn(linha[:limite], parse_mode=modo)
+            linha = linha[limite:]
+        if bloco and len(bloco) + len(linha) > limite:
+            await send_fn(bloco, parse_mode=modo)
             bloco = ""
         bloco += linha
     if bloco:
-        await send_fn(bloco, parse_mode=parse_mode)
+        await send_fn(bloco, parse_mode=modo)
 
 
 def _formatar_texto_ajuda():
@@ -327,18 +343,6 @@ def _normalizar_canal(item):
     return novo
 
 
-def _regex_generica_demais(padrao):
-    """Rejeita padrões que casariam com praticamente toda mensagem (ex.: '.', '.*', '\\w', 'a')."""
-    p = padrao.strip()
-    if len(p) < 2:
-        return True
-    return (
-        bool(re.search(p, "", re.IGNORECASE))
-        or all(re.search(p, s, re.IGNORECASE) for s in ("a", "1"))
-        or bool(re.fullmatch(p, " "))
-    )
-
-
 def _adicionar_regex_lote(banco, chave, argumento, caminho_json=ARQUIVO_JSON):
     """Adiciona uma ou várias expressões (separadas por ';' ou quebra de linha) com validação."""
     itens = [x.strip() for x in re.split(r"[;\n]+", argumento) if x.strip()]
@@ -348,7 +352,7 @@ def _adicionar_regex_lote(banco, chave, argumento, caminho_json=ARQUIVO_JSON):
         if not valida:
             invalidos.append(f"{item} ({erro})")
             continue
-        if _regex_generica_demais(item):
+        if regex_generica_demais(item):
             invalidos.append(f"{item} (genérica demais: casaria com quase toda mensagem)")
             continue
         if item in banco[chave]:
@@ -403,7 +407,7 @@ def _executar_add_teto(banco, argumento, caminho_json=ARQUIVO_JSON):
         valida, erro = regex_valida(produto)
         if not valida:
             return False, f"⚠️ Padrão inválido: <code>{html.escape(erro)}</code>"
-        if _regex_generica_demais(produto):
+        if regex_generica_demais(produto):
             return False, "⚠️ Padrão genérico demais: casaria com praticamente toda mensagem."
         min_p, max_p = parsear_faixa_preco(faixa_str)
         existentes = [k for k in banco["alvos_preco"] if k.lower() == produto.lower() and k != produto]
@@ -477,10 +481,15 @@ async def _executar_teste_sistema(send_fn, cfg):
 
 
 def _validar_estrutura_banco(novo):
-    """Valida tipos, faixas e regex de um backup; levanta ValueError com a causa."""
+    """Valida integralmente configurações e backups antes de ativá-los."""
+    if not isinstance(novo, dict):
+        raise ValueError("JSON raiz deve ser um objeto")
+
     for chave in ("canais", "palavras", "negativas"):
-        if not isinstance(novo.get(chave), list) or not all(isinstance(x, str) for x in novo[chave]):
-            raise ValueError(f"'{chave}' ausente ou não é uma lista de textos")
+        itens = novo.get(chave)
+        if not isinstance(itens, list) or not all(isinstance(x, str) and x.strip() for x in itens):
+            raise ValueError(f"'{chave}' deve ser uma lista de textos não vazios")
+
     tipos = {
         "alvos_preco": dict,
         "alvos_compostos": list,
@@ -491,34 +500,72 @@ def _validar_estrutura_banco(novo):
     for chave, tipo in tipos.items():
         if chave in novo and not isinstance(novo[chave], tipo):
             raise ValueError(f"'{chave}' deve ser do tipo {tipo.__name__}")
-    for padrao in novo["palavras"] + novo["negativas"] + list(novo.get("alvos_preco", {})):
+
+    def _validar_padrao(padrao, campo):
+        if not isinstance(padrao, str) or not padrao.strip():
+            raise ValueError(f"'{campo}' deve conter uma expressão não vazia")
         valida, erro = regex_valida(padrao)
         if not valida:
-            raise ValueError(f"Regex inválida '{padrao}': {erro}")
-    for faixa in novo.get("alvos_preco", {}).values():
-        if isinstance(faixa, bool) or not isinstance(faixa, (int, float, dict)):
-            raise ValueError("Faixa de preço inválida em 'alvos_preco'")
-        normalizar_faixa_preco(faixa)
+            raise ValueError(f"Regex inválida em '{campo}' ('{padrao}'): {erro}")
+        if regex_generica_demais(padrao):
+            raise ValueError(f"Regex genérica demais em '{campo}': '{padrao}'")
+
+    def _validar_numero(valor, campo, positivo=False):
+        if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+            raise ValueError(f"'{campo}' deve ser numérico")
+        num = float(valor)
+        if not math.isfinite(num) or num < 0 or (positivo and num <= 0):
+            raise ValueError(f"'{campo}' com valor inválido: {valor}")
+        return num
+
+    for padrao in novo["palavras"]:
+        _validar_padrao(padrao, "palavras")
+    for padrao in novo["negativas"]:
+        _validar_padrao(padrao, "negativas")
+
+    for chave_teto, faixa in novo.get("alvos_preco", {}).items():
+        _validar_padrao(chave_teto, "alvos_preco")
+        if isinstance(faixa, dict):
+            min_v = _validar_numero(faixa.get("min", 0), f"alvos_preco.{chave_teto}.min") if faixa.get("min") is not None else 0.0
+            max_v = _validar_numero(faixa.get("max"), f"alvos_preco.{chave_teto}.max", positivo=True)
+            if min_v > max_v:
+                raise ValueError(f"Faixa invertida em 'alvos_preco.{chave_teto}': {min_v} > {max_v}")
+        else:
+            _validar_numero(faixa, f"alvos_preco.{chave_teto}", positivo=True)
+
     for alvo in novo.get("alvos_compostos", []):
-        if (
-            not isinstance(alvo, dict)
-            or not isinstance(alvo.get("nome"), str)
-            or not alvo.get("nome").strip()
-            or not isinstance(alvo.get("incluir"), list)
-            or not alvo["incluir"]
-            or not all(isinstance(x, str) and regex_valida(x)[0] for x in alvo["incluir"])
-        ):
-            raise ValueError("Item de 'alvos_compostos' sem nome/incluir válidos")
-        if "excluir" in alvo and (
-            not isinstance(alvo["excluir"], list)
-            or not all(isinstance(x, str) and regex_valida(x)[0] for x in alvo["excluir"])
-        ):
-            raise ValueError(f"Combo '{alvo['nome']}' possui 'excluir' inválido")
-    for chave in ("desconto_minimo", "desconto_critico"):
-        if chave in novo:
-            if isinstance(novo[chave], bool):
-                raise ValueError(f"'{chave}' inválido")
-            float(novo[chave])
+        if not isinstance(alvo, dict) or not isinstance(alvo.get("nome"), str) or not alvo["nome"].strip():
+            raise ValueError("Item de 'alvos_compostos' sem 'nome' válido")
+        incluir = alvo.get("incluir")
+        if not isinstance(incluir, list) or not incluir:
+            raise ValueError(f"Combo '{alvo['nome']}' sem termos em 'incluir'")
+        for termo in incluir:
+            _validar_padrao(termo, f"alvos_compostos.{alvo['nome']}.incluir")
+        if "excluir" in alvo:
+            excluir = alvo["excluir"]
+            if not isinstance(excluir, list):
+                raise ValueError(f"Combo '{alvo['nome']}' possui 'excluir' inválido")
+            for termo in excluir:
+                _validar_padrao(termo, f"alvos_compostos.{alvo['nome']}.excluir")
+        teto_min = (
+            _validar_numero(alvo["teto_min"], f"alvos_compostos.{alvo['nome']}.teto_min")
+            if alvo.get("teto_min") is not None
+            else 0.0
+        )
+        if alvo.get("teto") is not None:
+            teto_max = _validar_numero(alvo["teto"], f"alvos_compostos.{alvo['nome']}.teto")
+            if teto_max > 0 and teto_min > teto_max:
+                raise ValueError(f"Faixa invertida no combo '{alvo['nome']}': {teto_min} > {teto_max}")
+
+    if "desconto_minimo" in novo:
+        d_min = _validar_numero(novo["desconto_minimo"], "desconto_minimo")
+        if d_min >= 100:
+            raise ValueError("'desconto_minimo' deve ser menor que 100")
+    if "desconto_critico" in novo:
+        d_crit = _validar_numero(novo["desconto_critico"], "desconto_critico")
+        if d_crit > 100:
+            raise ValueError("'desconto_critico' deve ser menor ou igual a 100")
+
     dnd = novo.get("nao_perturbe")
     if dnd is not None:
         for campo_h in ("inicio", "fim"):
@@ -527,11 +574,13 @@ def _validar_estrutura_banco(novo):
                 raise ValueError(f"'nao_perturbe.{campo_h}' deve ser hora inteira entre 0 e 23")
         if "ativo" in dnd and not isinstance(dnd["ativo"], bool):
             raise ValueError("'nao_perturbe.ativo' deve ser booleano")
+
     flt = novo.get("filtros_extras")
     if flt is not None:
         for campo_b in ("bloquear_usados", "bloquear_importacao"):
             if campo_b in flt and not isinstance(flt[campo_b], bool):
                 raise ValueError(f"'filtros_extras.{campo_b}' deve ser booleano")
+
     prio = novo.get("prioridades")
     if prio is not None:
         for cp in ("teto", "combo"):
@@ -541,6 +590,7 @@ def _validar_estrutura_banco(novo):
             not isinstance(prio["palavras_altas"], list) or not all(isinstance(x, str) for x in prio["palavras_altas"])
         ):
             raise ValueError("'prioridades.palavras_altas' deve ser lista de textos")
+
     if novo.get("resumo_hora") is not None:
         rh = novo["resumo_hora"]
         if isinstance(rh, bool) or not isinstance(rh, int) or not (0 <= rh <= 23):
@@ -828,7 +878,7 @@ async def processar_comando_painel(
     tinha_pendencia = bool(estado_runtime.get("aguardando"))
     estado_runtime["aguardando"] = None
     estado_runtime["aguardando_ate"] = None
-    partes = cmd_full.split(" ", 1)
+    partes = re.split(r"\s+", cmd_full.strip(), maxsplit=1)
     cmd_original = partes[0].lower()
     comando = ALIASES_COMANDO.get(cmd_original, cmd_original)
     argumento = partes[1].strip() if len(partes) > 1 else ""
@@ -1423,6 +1473,17 @@ async def processar_callback_painel(
         logger.info("Produto silenciado manualmente via botão (hash=%s, chave=%s).", hash_curto, chave_orig)
         return
 
+    if data.startswith("snz:"):
+        loja = normalizar_loja_snooze(data.split(":", 1)[1])
+        if loja:
+            estado_runtime.setdefault("snooze_lojas", {})[loja] = time.time() + 3600
+            await _substituir_botao_alerta(event, f"✅ {loja.title()} em snooze 1h")
+            await event.answer(f"😴 {loja.title()} silenciada por 1h!")
+            logger.info("Loja '%s' em snooze por 1h via botão do alerta.", loja)
+        else:
+            await event.answer("Loja inválida.")
+        return
+
     # 1b. Parar de monitorar o gatilho direto do alerta
     if data.startswith("stop:"):
         partes = data.split(":")
@@ -1672,15 +1733,17 @@ async def processar_callback_painel(
         await event.answer(toast)
 
 
-async def _resolver_link_e_produto(links_atuais, chat_id, agora, memoria_canais):
-    """Obtém o link da oferta (com fallback na memória de 5 min), expande e identifica produto."""
+async def _resolver_link_e_produto(links_atuais, chat_id, agora, memoria_canais, msg_id=None):
+    """Obtém o link da oferta (com fallback na memória de 5 min e até 3 msgs atrás), expande e identifica produto."""
     texto_recuperado = None
     links_combinados = list(links_atuais)
     link_oferta_bruto = escolher_link_oferta(links_combinados)
 
     if not link_oferta_bruto and chat_id in memoria_canais:
         memoria = memoria_canais[chat_id]
-        if (agora - memoria["tempo"]) <= 300:
+        mem_id = memoria.get("id")
+        distancia = (msg_id - mem_id) if (msg_id is not None and mem_id is not None) else 0
+        if (agora - memoria["tempo"]) <= 300 and 0 <= distancia <= 3:
             texto_recuperado = memoria["raw_text"]
             for lk in memoria["links"]:
                 if lk not in links_combinados:
@@ -1828,8 +1891,14 @@ async def _loop_resumo_diario(
 
             agora_dt = datetime.datetime.now()
             hoje = agora_dt.date().isoformat()
+            horario_programado = agora_dt.replace(
+                hour=int(resumo_hora),
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
 
-            if agora_dt.hour == int(resumo_hora) and estado_persistente.get("ultimo_resumo_data") != hoje:
+            if agora_dt >= horario_programado and estado_persistente.get("ultimo_resumo_data") != hoje:
                 stats_atual = estado_persistente.get("stats_dia", {})
                 data_ant = stats_atual.get("data", "")
                 if int(resumo_hora) == 0 and data_ant and data_ant != hoje:
@@ -1999,7 +2068,7 @@ async def processar_mensagem_cacador(
         texto_bruto, getattr(event, "entities", None), text_url_cls=MessageEntityTextUrl
     )
     if links_atuais:
-        memoria_canais[chat_id] = {"raw_text": texto_bruto, "links": links_atuais, "tempo": agora}
+        memoria_canais[chat_id] = {"raw_text": texto_bruto, "links": links_atuais, "tempo": agora, "id": event.id}
         chaves_expiradas = [k for k, v in memoria_canais.items() if (agora - v["tempo"]) > 300]
         for k in chaves_expiradas:
             del memoria_canais[k]
@@ -2032,7 +2101,7 @@ async def processar_mensagem_cacador(
         return
 
     link_para_abrir, link_bruto, info_produto, links_combinados, texto_recuperado = (
-        await _resolver_link_e_produto(links_atuais, chat_id, agora, memoria_canais)
+        await _resolver_link_e_produto(links_atuais, chat_id, agora, memoria_canais, getattr(event, "id", None))
     )
 
     loja_pausada = loja_em_snooze(

@@ -1544,6 +1544,226 @@ class BotTests(unittest.TestCase):
 
             asyncio.run(rodar())
 
+    def test_cache_expansao_distancia_msg_quebra_linha_e_botao_snooze_alerta(self):
+        from unittest.mock import patch
+
+        # M1: URL com produto_id já conhecido NÃO faz chamada de rede; encurtador usa cache na 2a chamada
+        core._CACHE_EXPANSAO.clear()
+        chamadas_rede = []
+
+        def fake_rede(url, timeout=4):
+            chamadas_rede.append(url)
+            return "https://www.amazon.com.br/dp/B09CACHE123"
+
+        with patch("core._expandir_link_rede", side_effect=fake_rede):
+            direto = "https://www.amazon.com.br/dp/B09DIRETO1?tag=abc"
+            self.assertEqual(core.expandir_link(direto), direto)
+            self.assertEqual(chamadas_rede, [])
+
+            curto = "https://amzn.to/cacheteste"
+            self.assertEqual(core.expandir_link(curto), "https://www.amazon.com.br/dp/B09CACHE123")
+            self.assertEqual(core.expandir_link(curto), "https://www.amazon.com.br/dp/B09CACHE123")
+            self.assertEqual(len(chamadas_rede), 1)
+
+        # M3: salvamento atômico chama os.fsync antes do os.replace
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            with patch("core.os.fsync") as mock_fsync:
+                core.salvar_dados({"canais": []}, json_path)
+            self.assertEqual(mock_fsync.call_count, 1)
+
+        # F3: botão "😴 Amazon 1h" gerado junto com "🤫 Silenciar 3h" e tratado no callback snz:
+        _, _, botoes = core.montar_mensagem_e_botoes_spec(
+            nome_grupo="Canal",
+            motivo_disparo="BUG",
+            prioridade="alta",
+            texto_bruto="BUG https://www.amazon.com.br/dp/B09V3KXJPB",
+            cupons=[],
+            info_produto={"loja": "Amazon", "produto_id": "amazon:B09V3KXJPB", "link_limpo": "https://www.amazon.com.br/dp/B09V3KXJPB", "carrinho_amazon": None},
+            link_oferta="https://www.amazon.com.br/dp/B09V3KXJPB",
+            link_origem="https://t.me/c/1/1",
+            chave_silenciar="aabbcc112233",
+        )
+        self.assertEqual(botoes[-1][0][1], "🤫 Silenciar 3h")
+        self.assertEqual(botoes[-1][1][1], "😴 Amazon 1h")
+        self.assertEqual(botoes[-1][1][2], "snz:amazon")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "pausado_ate": None, "inicio": time.time(), "aguardando": None, "snooze_lojas": {}}
+            est_pers = core.carregar_estado_persistente(est_path)
+
+            async def rodar():
+                # M2: recuperação da mensagem anterior exige 0 <= distancia <= 3
+                agora = time.time()
+                memoria = {
+                    "-1001": {
+                        "raw_text": "Veja https://www.amazon.com.br/dp/B09ANTIGO1",
+                        "links": ["https://www.amazon.com.br/dp/B09ANTIGO1"],
+                        "tempo": agora,
+                        "id": 100,
+                    }
+                }
+                link_perto, _, _, _, txt_rec = await bot._resolver_link_e_produto([], "-1001", agora, memoria, msg_id=102)
+                self.assertIn("B09ANTIGO1", link_perto)
+                self.assertIsNotNone(txt_rec)
+
+                link_longe, _, _, _, txt_none = await bot._resolver_link_e_produto([], "-1001", agora, memoria, msg_id=105)
+                self.assertIsNone(link_longe)
+                self.assertIsNone(txt_none)
+
+                # B1: comando com quebra de linha antes do argumento (/simular\nBUG...)
+                ev_nl = FakeEvent("/simular\nMonitor BUG R$ 200 https://www.amazon.com.br/dp/B09V3KXJPB")
+                await bot.processar_comando_painel(ev_nl, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("DISPARARIA", ev_nl.respostas[0][0])
+
+                # F3: callback snz:amazon coloca Amazon em snooze por ~1h
+                cb_snz = FakeCallback("snz:amazon")
+                await bot.processar_callback_painel(
+                    cb_snz, banco, cfg, est_run, est_pers, {}, fake_bot, json_path, est_path, log_path
+                )
+                self.assertIn("amazon", est_run["snooze_lojas"])
+                self.assertGreater(est_run["snooze_lojas"]["amazon"], time.time() + 3500)
+
+            asyncio.run(rodar())
+
+    def test_validacao_combo_redos_resumo_tardio_dns_pinning_e_particionamento(self):
+        import socket
+        import urllib.error
+        from unittest.mock import patch
+
+        # Problema 1: backup rejeita teto_min textual, faixa invertida, string vazia e .* em negativas
+        base_ok = {"canais": ["@c"], "palavras": [r"\bbug\b"], "negativas": [r"\besgotado\b"]}
+        bot._validar_estrutura_banco(base_ok)
+
+        invalidos = [
+            {**base_ok, "canais": [""]},
+            {**base_ok, "negativas": [".*"]},
+            {**base_ok, "alvos_preco": {"ssd": {"min": 500, "max": 200}}},
+            {**base_ok, "alvos_compostos": [{"nome": "SSD", "incluir": ["ssd"], "teto_min": "abc", "teto": 200}]},
+            {**base_ok, "alvos_compostos": [{"nome": "SSD", "incluir": ["ssd"], "teto_min": 300, "teto": 200}]},
+            {**base_ok, "alvos_compostos": [{"nome": "SSD", "incluir": [".*"], "teto": 200}]},
+        ]
+        for payload in invalidos:
+            with self.assertRaises(ValueError):
+                bot._validar_estrutura_banco(payload)
+
+        # Problema 2: ReDoS ((a+)+$) rejeitada na validação e neutralizada rapidamente em match_padrao
+        ok_re, erro_re = core.regex_valida("(a+)+$")
+        self.assertFalse(ok_re)
+        self.assertIn("ReDoS", erro_re)
+        t0 = time.perf_counter()
+        self.assertFalse(core.match_padrao("(a+)+$", ("a" * 30) + "!"))
+        self.assertLess(time.perf_counter() - t0, 0.2)
+
+        # Problema 4: IP pinning resolve DNS uma vez e conecta usando o IP validado (bloqueia DNS rebinding)
+        core.PERMITIR_REDE_LOCAL = False
+        try:
+            getaddr_calls = []
+
+            def fake_getaddr(host, port, **kwargs):
+                getaddr_calls.append((host, port))
+                # Na 1a chamada devolve IP público; se houvesse 2a chamada devolveria 127.0.0.1!
+                if len(getaddr_calls) == 1:
+                    return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port))]
+                return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port))]
+
+            conectou_para = []
+
+            class DummySock:
+                def setsockopt(self, *a, **kw):
+                    pass
+
+                def close(self):
+                    pass
+
+            def fake_create_conn(addr, timeout=None, source_address=None):
+                conectou_para.append(addr)
+                return DummySock()
+
+            with patch("core.socket.getaddrinfo", side_effect=fake_getaddr), patch(
+                "core.socket.create_connection", side_effect=fake_create_conn
+            ):
+                conn = core._PinnedHTTPConnection("exemplo.com", 80, timeout=2)
+                self.assertEqual(conn.host, "exemplo.com")
+                conn.connect()
+                self.assertEqual(len(getaddr_calls), 1)
+                self.assertEqual(conectou_para, [("93.184.216.34", 80)])
+
+            # Qualquer IP privado junto da resposta reprova o host
+            with patch(
+                "core.socket.getaddrinfo",
+                return_value=[
+                    (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443)),
+                    (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 443)),
+                ],
+            ):
+                with self.assertRaises(urllib.error.URLError):
+                    core._resolver_ip_publico_host("duplo.com", 443)
+        finally:
+            core.PERMITIR_REDE_LOCAL = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            est_path = os.path.join(tmp, "estado.json")
+            banco = core.carregar_dados(os.path.join(tmp, "banco.json"))
+            banco["resumo_hora"] = 21
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777}
+            est_pers = core.carregar_estado_persistente(est_path)
+
+            async def rodar():
+                # Problema 3: reiniciou às 22:30 com resumo marcado às 21:00 -> ainda envia no dia
+                chamadas = {"n": 0}
+
+                async def sleep_uma(_):
+                    chamadas["n"] += 1
+                    if chamadas["n"] >= 2:
+                        raise asyncio.CancelledError()
+
+                fake_agora = datetime.datetime(2026, 11, 11, 22, 30, 0)
+
+                class FakeDateTime(datetime.datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return fake_agora
+
+                with patch("bot.datetime.datetime", FakeDateTime), patch("bot.asyncio.sleep", side_effect=sleep_uma):
+                    await bot._loop_resumo_diario(fake_bot, cfg, banco, est_pers, asyncio.Lock(), est_path)
+
+                self.assertEqual(len(fake_bot.mensagens), 1)
+                self.assertEqual(est_pers["ultimo_resumo_data"], "2026-11-11")
+
+                # Problema 5: linha > 3900 não envia mensagem vazia e fragmenta abaixo do limite
+                enviadas = []
+
+                async def fake_send(txt, **kw):
+                    enviadas.append((txt, kw.get("parse_mode")))
+
+                await bot.enviar_em_partes_fn(fake_send, "<b>" + ("X" * 5000) + "</b>", parse_mode="html")
+                self.assertGreater(len(enviadas), 1)
+                self.assertTrue(all(txt and len(txt) <= 3900 for txt, _ in enviadas))
+                self.assertTrue(all(pm is None for _, pm in enviadas))
+                self.assertEqual("".join(txt for txt, _ in enviadas), "X" * 5000)
+
+                # Muitas linhas curtas preservam HTML e não excedem 3900
+                enviadas_html = []
+
+                async def fake_send_html(txt, **kw):
+                    enviadas_html.append((txt, kw.get("parse_mode")))
+
+                texto_html = ("• <b>Item</b> de teste grande\n") * 200
+                await bot.enviar_em_partes_fn(fake_send_html, texto_html, parse_mode="html")
+                self.assertGreater(len(enviadas_html), 1)
+                self.assertTrue(all(txt and len(txt) <= 3900 and pm == "html" for txt, pm in enviadas_html))
+
+            asyncio.run(rodar())
+
 
 if __name__ == "__main__":
     unittest.main()
