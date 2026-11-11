@@ -114,6 +114,28 @@ ENCURTADORES_E_LOJAS = (
     "bit.ly", "tinyurl.com", "cutt.ly", "is.gd", "bityli.com", "ofertou.com",
 )
 
+HOSTS_CONFIAVEIS_MACRODROID = (
+    "amazon.com.br", "amazon.com", "amzn.to", "a.co",
+    "mercadolivre.com.br", "mercadolivre.com", "meli.la",
+    "shopee.com.br", "shopee.com", "shp.ee",
+    "magazineluiza.com.br", "magalu.com", "magazinevoce.com.br",
+    "kabum.com.br", "aliexpress.com",
+)
+
+
+def host_confiavel(url):
+    """True só se a URL é http(s) e o host é exatamente (ou subdomínio de) uma loja conhecida."""
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(host) and any(host == d or host.endswith("." + d) for d in HOSTS_CONFIAVEIS_MACRODROID)
+
 PARAMS_TRACKING = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
     "fbclid", "gclid", "dclid", "msclkid", "ref", "ref_", "tag", "linkcode",
@@ -306,6 +328,7 @@ def _estado_padrao():
         "dedup": {},
         "ultimos": [],
         "ultimo_resumo_data": "",
+        "ultimo_backup_ts": 0.0,
         "por_canal": {},
         "stats_dia": {
             "data": datetime.date.today().isoformat(),
@@ -335,6 +358,7 @@ def carregar_estado_persistente(caminho_estado=ARQUIVO_ESTADO):
     base["dedup"] = {k: float(v) for k, v in dedup_raw.items() if float(v) > agora}
     base["ultimos"] = list(lido.get("ultimos", []))[-20:]
     base["ultimo_resumo_data"] = lido.get("ultimo_resumo_data", "")
+    base["ultimo_backup_ts"] = float(lido.get("ultimo_backup_ts", 0) or 0)
     base["por_canal"] = {
         str(nome): {"lidas": int(d.get("lidas", 0)), "alertas": int(d.get("alertas", 0))}
         for nome, d in (lido.get("por_canal") or {}).items()
@@ -654,24 +678,40 @@ def _resultado_gatilho(
     }
 
 
+def _limpar_texto_para_gatilhos(texto):
+    """Remove URLs, rótulos de link ('Link PC:') e rodapés de canais para evitar falsos alarmes."""
+    if not texto:
+        return ""
+    limpo = re.sub(r"(?:https?://|t\.me/)\S+", " ", texto, flags=re.IGNORECASE)
+    limpo = re.sub(r"(?im)^[^\w\n]*(?:grupo|canal|comunidade)\s+de\s+ofertas\b.*$", "", limpo)
+    limpo = re.sub(
+        r"(?i)\b(?:link|bot[aã]o|acesse|abra)\s+(?:no\s+|pelo\s+|via\s+|para\s+|pro\s+|do\s+)?(?:pc|app|navegador|computador|celular|android|ios)\b\s*:?",
+        " ",
+        limpo,
+    )
+    return re.sub(r"[ \t]+", " ", limpo)
+
+
 def avaliar_gatilhos(texto_bruto, banco):
     """
     Avalia bloqueios, filtros extras e gatilhos respeitando prioridades configuradas.
     Retorna dict: {disparar, motivo, prioridade, preco, bloqueado_por, tipo_gatilho, alvo_gatilho}
     """
+    texto_busca = _limpar_texto_para_gatilhos(texto_bruto)
+
     for neg in banco.get("negativas", []):
-        if match_padrao(neg, texto_bruto):
+        if match_padrao(neg, texto_busca):
             return _resultado_gatilho(False, f"Bloqueio negativo ({neg})", bloqueado_por="negativa")
 
     filtros = banco.get("filtros_extras", {})
     if filtros.get("bloquear_usados"):
         for pad in PADROES_USADOS:
-            if match_padrao(pad, texto_bruto):
+            if match_padrao(pad, texto_busca):
                 return _resultado_gatilho(False, f"Filtro usado/recondicionado ({pad})", bloqueado_por="filtro_usado")
 
     if filtros.get("bloquear_importacao"):
         for pad in PADROES_IMPORTACAO:
-            if match_padrao(pad, texto_bruto):
+            if match_padrao(pad, texto_busca):
                 return _resultado_gatilho(False, f"Filtro compra internacional ({pad})", bloqueado_por="filtro_importacao")
 
     preco_encontrado = extrair_preco(texto_bruto)
@@ -688,9 +728,9 @@ def avaliar_gatilhos(texto_bruto, banco):
         teto_min = float(alvo.get("teto_min", 0) or 0)
         teto_max = alvo.get("teto")
 
-        if not incluir or not all(match_padrao(termo, texto_bruto) for termo in incluir):
+        if not incluir or not all(match_padrao(termo, texto_busca) for termo in incluir):
             continue
-        if any(match_padrao(termo, texto_bruto) for termo in excluir):
+        if any(match_padrao(termo, texto_busca) for termo in excluir):
             continue
         if teto_max is not None and float(teto_max) > 0:
             if preco_encontrado is None or preco_encontrado < teto_min or preco_encontrado > float(teto_max):
@@ -710,7 +750,7 @@ def avaliar_gatilhos(texto_bruto, banco):
     if preco_encontrado is not None:
         for produto, valor_teto in banco.get("alvos_preco", {}).items():
             min_p, max_p = normalizar_faixa_preco(valor_teto)
-            if match_padrao(produto, texto_bruto) and min_p <= preco_encontrado <= max_p:
+            if match_padrao(produto, texto_busca) and min_p <= preco_encontrado <= max_p:
                 res = _resultado_gatilho(
                     True,
                     f"Teto Atingido ({produto} por R$ {preco_encontrado:.2f})",
@@ -741,7 +781,7 @@ def avaliar_gatilhos(texto_bruto, banco):
     # 4. Palavras-chave (avalia altas primeiro, depois normais)
     palavras = banco.get("palavras", [])
     for palavra in palavras:
-        if palavra_eh_alta(banco, palavra) and match_padrao(palavra, texto_bruto):
+        if palavra_eh_alta(banco, palavra) and match_padrao(palavra, texto_busca):
             return _resultado_gatilho(
                 True,
                 f"Palavra-Chave ({palavra})",
@@ -752,7 +792,7 @@ def avaliar_gatilhos(texto_bruto, banco):
             )
 
     for palavra in palavras:
-        if not palavra_eh_alta(banco, palavra) and match_padrao(palavra, texto_bruto):
+        if not palavra_eh_alta(banco, palavra) and match_padrao(palavra, texto_busca):
             candidato_normal = candidato_normal or _resultado_gatilho(
                 True,
                 f"Palavra-Chave ({palavra})",
@@ -1067,12 +1107,12 @@ def obter_carrinho_amazon(url_real):
 def identificar_produto(url):
     """Identifica loja, ID único para deduplicação, link limpo e carrinho Amazon."""
     parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc.lower()
+    host = (parsed.hostname or "").lower()
     path = parsed.path
     link_limpo = limpar_parametros_url(url)
     resultado = {"loja": None, "produto_id": None, "link_limpo": link_limpo, "carrinho_amazon": None}
 
-    if "amazon." in host:
+    if re.search(r"(?:^|\.)amazon\.(?:com(?:\.[a-z]{2})?|co\.[a-z]{2}|[a-z]{2,3})$", host):
         resultado["loja"] = "Amazon"
         asin = _extrair_asin_amazon(url)
         if asin:
@@ -1081,7 +1121,7 @@ def identificar_produto(url):
             resultado["carrinho_amazon"] = obter_carrinho_amazon(resultado["link_limpo"])
         return resultado
 
-    if "mercadolivre." in host:
+    if re.search(r"(?:^|\.)mercadoli(?:vre|bre)\.(?:com(?:\.[a-z]{2})?|[a-z]{2,3})$", host):
         resultado["loja"] = "Mercado Livre"
         match = re.search(r"\b(MLB)-?(\d{6,14})\b", path, re.IGNORECASE) or re.search(
             r"\b(MLB)-?(\d{6,14})\b", url, re.IGNORECASE
@@ -1090,7 +1130,7 @@ def identificar_produto(url):
             resultado["produto_id"] = f"ml:MLB{match.group(2)}"
         return resultado
 
-    if "shopee." in host:
+    if re.search(r"(?:^|\.)shopee\.(?:com(?:\.[a-z]{2})?|co\.[a-z]{2}|[a-z]{2,3})$", host):
         resultado["loja"] = "Shopee"
         match = re.search(r"(?:-i\.(\d+)\.(\d+)|/product/(\d+)/(\d+))", url, re.IGNORECASE)
         if match:
@@ -1100,21 +1140,21 @@ def identificar_produto(url):
             resultado["link_limpo"] = f"https://shopee.com.br/product/{shop_id}/{item_id}"
         return resultado
 
-    if "kabum." in host:
+    if re.search(r"(?:^|\.)kabum\.com\.br$", host):
         resultado["loja"] = "Kabum"
         match = re.search(r"/produto/(\d+)", path, re.IGNORECASE)
         if match:
             resultado["produto_id"] = f"kabum:{match.group(1)}"
         return resultado
 
-    if "magazineluiza." in host or "magalu." in host:
+    if re.search(r"(?:^|\.)(?:magazineluiza\.com\.br|magalu\.com|magazinevoce\.com\.br)$", host):
         resultado["loja"] = "Magalu"
         match = re.search(r"/p/([a-zA-Z0-9]+)", path, re.IGNORECASE)
         if match:
             resultado["produto_id"] = f"magalu:{match.group(1).lower()}"
         return resultado
 
-    if "aliexpress." in host:
+    if re.search(r"(?:^|\.)aliexpress\.(?:com|ru|us)$", host):
         resultado["loja"] = "AliExpress"
         match = re.search(r"/item/(\d+)\.html", path, re.IGNORECASE)
         if match:
@@ -1280,6 +1320,28 @@ def _formatar_rotulo_parar(alvo):
     return f'🔕 Parar de monitorar "{limpo}"'
 
 
+def _truncar_html_seguro(texto_html, limite):
+    """Corta HTML sem deixar tag aberta ou entidade (&amp;) pela metade."""
+    if len(texto_html) <= limite:
+        return texto_html
+    reserva_tags = 32
+    corte = max(0, limite - reserva_tags)
+    trecho = texto_html[:corte]
+    trecho = re.sub(r"<[^>]*$", "", trecho)
+    trecho = re.sub(r"&[^;\s<]*$", "", trecho)
+    pilha = []
+    for m in re.finditer(r"<(/?)(b|i|code)\b[^>]*>", trecho, re.IGNORECASE):
+        eh_fechamento = bool(m.group(1))
+        tag = m.group(2).lower()
+        if not eh_fechamento:
+            pilha.append(tag)
+        elif tag in pilha:
+            idx = len(pilha) - 1 - pilha[::-1].index(tag)
+            pilha.pop(idx)
+    fechamentos = "".join(f"</{t}>" for t in reversed(pilha))
+    return f"{trecho}{fechamentos}..."
+
+
 def montar_mensagem_e_botoes_spec(
     nome_grupo,
     motivo_disparo,
@@ -1338,19 +1400,15 @@ def montar_mensagem_e_botoes_spec(
         for lk in links_visiveis[:4]:
             bloco_links.append(html.escape(lk))
 
-    mensagem_completa = "\n".join(cabecalho + [""] + corpo + bloco_links)
-    if len(mensagem_completa) > 4000:
-        mensagem_completa = mensagem_completa[:3990] + "\n..."
+    mensagem_completa = _truncar_html_seguro("\n".join(cabecalho + [""] + corpo + bloco_links), 4000)
 
     if len(mensagem_completa) <= 1000:
         legenda_foto = mensagem_completa
     else:
         base_cab = "\n".join(cabecalho)
         espaco_corpo = max(80, 960 - len(base_cab))
-        corpo_txt = "\n".join(corpo)
-        if len(corpo_txt) > espaco_corpo:
-            corpo_txt = corpo_txt[:espaco_corpo - 3] + "..."
-        legenda_foto = f"{base_cab}\n\n{corpo_txt}"[:1000]
+        corpo_txt = _truncar_html_seguro("\n".join(corpo), espaco_corpo)
+        legenda_foto = _truncar_html_seguro(f"{base_cab}\n\n{corpo_txt}", 1000)
 
     botoes_spec = []
     if url_valida_botao(link_oferta):
@@ -1516,10 +1574,15 @@ def remover_chaves_dict(dicionario, argumento):
         removidos.reverse()
         return removidos, nao_encontrados
 
-    for item in [x.strip().lower() for x in re.split(r"[;\n]+", arg) if x.strip()]:
+    mapa_lower = {k.lower(): k for k in dicionario}
+    for item in [x.strip() for x in re.split(r"[;\n]+", arg) if x.strip()]:
         if item in dicionario:
             del dicionario[item]
             removidos.append(item)
+        elif item.lower() in mapa_lower:
+            real = mapa_lower.pop(item.lower())
+            del dicionario[real]
+            removidos.append(real)
         else:
             nao_encontrados.append(item)
     return removidos, nao_encontrados
@@ -1565,6 +1628,10 @@ def formatar_lista_numerada(itens, titulo, comando_del):
 def montar_painel_menu_spec(banco, estado_runtime, estado_persistente):
     """Monta painel interativo principal (/menu)."""
     stats = garantir_stats_do_dia(estado_persistente)
+    ate_pausa = estado_runtime.get("pausado_ate")
+    if estado_runtime.get("pausado") and ate_pausa and time.time() >= ate_pausa:
+        estado_runtime["pausado"] = False
+        estado_runtime["pausado_ate"] = None
     pausado = estado_runtime.get("pausado", False)
     dnd = banco.get("nao_perturbe", {})
     filtros = banco.get("filtros_extras", {})
@@ -1606,13 +1673,52 @@ def montar_painel_menu_spec(banco, estado_runtime, estado_persistente):
 
     botoes_spec = [
         [("inline", "📋 Listas", "menu:lista"), ("inline", "📊 Status", "menu:status"), ("inline", "🧪 Teste", "menu:teste")],
-        [("inline", pausa_lbl, "menu:pausa"), ("inline", dnd_lbl, "menu:dnd")],
+        [("inline", pausa_lbl, "menu:pausa"), ("inline", dnd_lbl, "dnd:main")],
         [("inline", usados_lbl, "menu:usados"), ("inline", import_lbl, "menu:import")],
         [("inline", "⚡ Prioridades e Faixas", "prio:main"), ("inline", "💾 Backup", "menu:backup")],
         [("inline", "🕘 Últimos", "menu:ultimos"), ("inline", "📄 Logs", "menu:logs"), ("inline", "❓ Atalhos", "menu:ajuda")],
     ]
     if qtd_snooze > 0:
         botoes_spec.append([("inline", f"🔔 Limpar Snooze ({qtd_snooze})", "menu:limpar_snooze")])
+    return texto, botoes_spec
+
+
+def montar_painel_dnd_spec(banco):
+    """Monta painel visual para ligar/desligar e ajustar o período do Não Perturbe (DND)."""
+    dnd = banco.setdefault("nao_perturbe", {"ativo": True, "inicio": 0, "fim": 7})
+    ativo = bool(dnd.get("ativo", False))
+    inicio = int(dnd.get("inicio", 0))
+    fim = int(dnd.get("fim", 7))
+
+    estado_txt = "✅ Ativado" if ativo else "🔕 Desativado"
+    aviso_igual = "\n⚠️ <i>Início e fim iguais desativam o corte automático.</i>" if inicio == fim else ""
+    texto = (
+        f"🌙 <b>Configurar Não Perturbe (DND)</b>\n\n"
+        f"• Estado: <b>{estado_txt}</b>\n"
+        f"• Período: <b>{inicio:02d}h às {fim:02d}h</b>\n"
+        f"• Efeito: segura alertas 🟡 <b>NORMAL</b> nesse horário (envia Digest silencioso ao acabar); "
+        f"🔴 <b>ALTA / BUG</b> continuam tocando.{aviso_igual}\n\n"
+        f"<i>Use os botões abaixo ou digite</i> <code>/dnd 23-7</code> <i>/</i> <code>/dnd off</code>"
+    )
+    botoes_spec = [
+        [("inline", "🌙 Ativo (Toque p/ Desligar)" if ativo else "☀️ Desligado (Toque p/ Ligar)", "dnd:toggle")],
+        [
+            ("inline", "➖ Início", "dnd:ini:-1"),
+            ("inline", f"Início: {inicio:02d}h", "noop"),
+            ("inline", "➕ Início", "dnd:ini:1"),
+        ],
+        [
+            ("inline", "➖ Fim", "dnd:fim:-1"),
+            ("inline", f"Fim: {fim:02d}h", "noop"),
+            ("inline", "➕ Fim", "dnd:fim:1"),
+        ],
+        [
+            ("inline", "23h–07h", "dnd:set:23:7"),
+            ("inline", "00h–07h", "dnd:set:0:7"),
+            ("inline", "22h–06h", "dnd:set:22:6"),
+        ],
+        [("inline", "⬅️ Menu", "menu:home")],
+    ]
     return texto, botoes_spec
 
 

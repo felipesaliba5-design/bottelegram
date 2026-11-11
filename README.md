@@ -85,16 +85,17 @@ Ao iniciar, o bot registra os comandos automaticamente no menu `/` do Telegram. 
 | `/simular` (`/sim texto`) | Simula extração (preço, desconto, parcelamento, cupom) e mostra se a regra dispararia |
 | `/snooze` (`amazon 60`, `off`) | Silencia alertas de uma loja temporariamente sem afetar as demais |
 | `/ultimos` (`/u`) | Exibe os últimos 10 alertas enviados |
+| `/buscar termo` | Pesquisa nos últimos alertas por loja, motivo, canal ou link |
 | `/logs [30]` | Mostra as últimas linhas de `logs/bot.log` |
 | `/backup` (`/b`) | Envia o `banco_de_dados.json` no chat (envie um `.json` de volta para restaurar) |
-| `/pausar` (`/p` alterna) / `/retomar` (`/r`) | Pausa ou retoma o monitoramento |
+| `/pausar [min]` (`/p` alterna) / `/retomar` (`/r`) | Pausa (com retorno automático opcional em X min) ou retoma o monitoramento |
 | `/addcanal` (`/ac @c1 @c2`) / `/delcanal` (`/dc 1`) | Adiciona em lote ou remove por nº/nome |
 | `/addpalavra` (`/ap t1; t2`) / `/delpalavra` (`/dp 1, 3`) | Adiciona em lote ou remove por nº/texto |
 | `/addbloqueio` (`/ab t1; t2`) / `/delbloqueio` (`/db 1`) | Adiciona em lote ou remove por nº/texto |
 | `/addteto` (`/at item, 400-1300`) / `/delteto` (`/dt 1`) | Define faixa min-max (ou só máx) e remove por nº/nome |
 | `/addcomposto` (`/ax nome \| ter1 + ter2 \| ex \| 120-220`) / `/delcomposto` (`/dx 1`) | Cria regra composta e remove por nº/nome |
 | `/setdesconto` (`/sd 65, 75`) | Define mínimo normal e crítico para MacroDroid (`off` desativa crítico, `0` desativa tudo) |
-| `/dnd 0-7` / `/dnd off` | Configura horário do modo madrugada (Não Perturbe) |
+| `/dnd` / `/dnd 23-7` / `/dnd off` | Abre editor visual por botões ou ajusta o horário do Não Perturbe |
 | `/filtro usados on\|off` / `/filtro importacao on\|off` | Liga/desliga bloqueio automático de usados e importações |
 | `/resumo` (`/res 21` / `off`) | Define a hora do resumo diário automático |
 | `/getid` | Enviado por você dentro de um grupo/canal privado para receber o ID no bot |

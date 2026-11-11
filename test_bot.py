@@ -1245,14 +1245,54 @@ class BotTests(unittest.TestCase):
                     await bot.processar_mensagem_cacador(
                         ev_repost, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
                     )
-                self.assertEqual(len(est_pers["dedup"]), 1)  # apenas o 1o alerta continua no dedup
+                self.assertEqual(len(est_pers["dedup"]), 2)  # 1o alerta alto mantém chave_unica + chave#alta
 
                 falhar_envio["ativo"] = False
                 with patch("bot.disparar_macrodroid", side_effect=fake_macrodroid):
                     await bot.processar_mensagem_cacador(
                         ev_repost, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
                     )
-                self.assertEqual(len(est_pers["dedup"]), 2)
+                self.assertEqual(len(est_pers["dedup"]), 4)
+
+                # M1: alerta normal NÃO bloqueia o BUG do mesmo produto, e BUG -> 2o BUG é barrado
+                banco["nao_perturbe"]["ativo"] = False
+                url_up = "https://www.amazon.com.br/dp/B09UPGRADE1?ref=teste1234567890"
+                ev_n1 = FakeCanalEvent(-100123, 20, "Canal Teste", "canalteste", f"oferta_normal Mouse {url_up}")
+                ev_b1 = FakeCanalEvent(-100123, 21, "Canal Teste", "canalteste", f"BUG Mouse {url_up}")
+                ev_b2 = FakeCanalEvent(-100123, 22, "Canal Teste", "canalteste", f"BUG Mouse {url_up}")
+                qtd_antes = len(fake_bot.mensagens)
+                macro_antes = sum(1 for e in eventos_ordem if e[0] == "macrodroid")
+                with patch("bot.disparar_macrodroid", side_effect=fake_macrodroid):
+                    await bot.processar_mensagem_cacador(
+                        ev_n1, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
+                    )
+                    await bot.processar_mensagem_cacador(
+                        ev_b1, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
+                    )
+                    await bot.processar_mensagem_cacador(
+                        ev_b2, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
+                    )
+                    await asyncio.sleep(0.05)
+                self.assertEqual(len(fake_bot.mensagens) - qtd_antes, 2)  # n1 + b1 enviados; b2 barrado
+                self.assertEqual(sum(1 for e in eventos_ordem if e[0] == "macrodroid") - macro_antes, 1)
+
+                # A1: BUG com host não confiável vai pro Telegram, mas NÃO aciona o MacroDroid
+                ev_evil = FakeCanalEvent(
+                    -100123,
+                    23,
+                    "Canal Teste",
+                    "canalteste",
+                    "BUG Monitor https://amazon.evil.com/dp/B09EVIL123?ref=teste1234567890",
+                )
+                macro_antes2 = sum(1 for e in eventos_ordem if e[0] == "macrodroid")
+                tg_antes2 = len(fake_bot.mensagens)
+                with patch("bot.disparar_macrodroid", side_effect=fake_macrodroid):
+                    await bot.processar_mensagem_cacador(
+                        ev_evil, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
+                    )
+                    await asyncio.sleep(0.05)
+                self.assertEqual(len(fake_bot.mensagens) - tg_antes2, 1)
+                self.assertEqual(sum(1 for e in eventos_ordem if e[0] == "macrodroid"), macro_antes2)
 
                 # F3: comando /ranking exibe canal com taxa e /ranking mudo
                 ev_rank = FakeEvent("/rank")
@@ -1300,6 +1340,207 @@ class BotTests(unittest.TestCase):
                     await bot._loop_sentinela(fake_bot, cfg, banco, est_run, limite_horas=3.0, intervalo=0)
                 avisos_sent = [m for m in fake_bot.mensagens if "Sentinela:" in m[1]]
                 self.assertEqual(len(avisos_sent), 1)
+
+            asyncio.run(rodar())
+
+    def test_host_confiavel_pausa_temporaria_buscar_backup_semanal_e_baixa_prioridade(self):
+        from unittest.mock import patch
+
+        # A1: host_confiavel e identificar_produto rejeitam domínios maliciosos parecidos
+        self.assertTrue(core.host_confiavel("https://www.amazon.com.br/dp/B09V3KXJPB"))
+        self.assertTrue(core.host_confiavel("https://amzn.to/abc"))
+        self.assertTrue(core.host_confiavel("https://s.shopee.com.br/xyz"))
+        self.assertFalse(core.host_confiavel("https://amazon.evil.com/dp/B09V3KXJPB"))
+        self.assertFalse(core.host_confiavel("https://evilamazon.com/dp/123"))
+        self.assertFalse(core.host_confiavel("javascript://amazon.com.br/x"))
+        self.assertIsNone(core.identificar_produto("https://amazon.evil.com/dp/B09V3KXJPB")["loja"])
+
+        # Baixa prioridade: corte HTML > 4000 chars nunca deixa tag aberta
+        texto_enorme = "Promoção com <code>CUPOM10</code> " * 200
+        msg_enorme, legenda_enorme, _ = core.montar_mensagem_e_botoes_spec(
+            nome_grupo="Canal",
+            motivo_disparo="Teste",
+            prioridade="alta",
+            texto_bruto=texto_enorme,
+            cupons=["CUPOM10"],
+            info_produto={"loja": "Amazon", "produto_id": None, "link_limpo": None, "carrinho_amazon": None},
+            link_oferta="https://www.amazon.com.br/dp/B09V3KXJPB",
+            link_origem="https://t.me/c/1/1",
+        )
+        self.assertLessEqual(len(msg_enorme), 4005)
+        self.assertEqual(msg_enorme.count("<code>"), msg_enorme.count("</code>"))
+        self.assertLessEqual(len(legenda_enorme), 1005)
+        self.assertEqual(legenda_enorme.count("<code>"), legenda_enorme.count("</code>"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "pausado_ate": None, "inicio": time.time(), "aguardando": None, "aguardando_ate": None}
+            est_pers = core.carregar_estado_persistente(est_path)
+
+            async def rodar():
+                # /at rejeita regex genérica e preserva \S sem converter para \s
+                ev_at_gen = FakeEvent("/at ., 500")
+                await bot.processar_comando_painel(ev_at_gen, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("genérico demais", ev_at_gen.respostas[0][0])
+
+                ev_at_ok = FakeEvent(r"/at \bSSD\S+, 500")
+                await bot.processar_comando_painel(ev_at_ok, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn(r"\bSSD\S+", banco["alvos_preco"])
+
+                ev_dt_ok = FakeEvent(r"/dt \bssd\s+")
+                await bot.processar_comando_painel(ev_dt_ok, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertNotIn(r"\bSSD\S+", banco["alvos_preco"])
+
+                # Backup rejeita nao_perturbe com inicio inválido e resumo_hora booleano
+                for bad in (
+                    {"canais": ["@c"], "palavras": ["bug"], "negativas": [], "nao_perturbe": {"inicio": "x", "fim": 7}},
+                    {"canais": ["@c"], "palavras": ["bug"], "negativas": [], "resumo_hora": True},
+                ):
+                    ev_b = FakeEvent(document=True, file_name="bad.json", doc_bytes=json.dumps(bad).encode("utf-8"))
+                    await bot.processar_backup_recebido(ev_b, banco, json_path)
+                    self.assertIn("Falha ao restaurar JSON", ev_b.respostas[0][0])
+
+                # Texto solto sem wizard responde aviso orientativo
+                ev_solto = FakeEvent("oi tudo bem")
+                await bot.processar_comando_painel(ev_solto, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("/menu", ev_solto.respostas[0][0])
+
+                # F1: Pausa temporária e retorno automático ao expirar
+                ev_p30 = FakeEvent("/pausar 30")
+                await bot.processar_comando_painel(ev_p30, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertTrue(est_run["pausado"])
+                self.assertIsNotNone(est_run["pausado_ate"])
+                self.assertIn("30 min", ev_p30.respostas[0][0])
+
+                ev_p_bad = FakeEvent("/pausar 30m")
+                await bot.processar_comando_painel(ev_p_bad, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("1 e 1440", ev_p_bad.respostas[0][0])
+
+                est_run["pausado_ate"] = time.time() - 5
+                bot._verificar_auto_retomar(est_run)
+                self.assertFalse(est_run["pausado"])
+                self.assertIsNone(est_run["pausado_ate"])
+
+                # F3: /buscar encontra alertas por loja/motivo/link
+                core.registrar_alerta_enviado(
+                    est_pers,
+                    {"hora": "10:15", "grupo": "Promo", "loja": "Amazon", "motivo": "Teto SSD", "link": "https://amzn.to/ssd"},
+                    est_path,
+                )
+                ev_bus_ok = FakeEvent("/buscar amazon")
+                await bot.processar_comando_painel(ev_bus_ok, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("resultado(s)", ev_bus_ok.respostas[0][0])
+                self.assertIn("Teto SSD", ev_bus_ok.respostas[0][0])
+
+                ev_bus_vazio = FakeEvent("/buscar geladeira")
+                await bot.processar_comando_painel(ev_bus_vazio, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Nada encontrado", ev_bus_vazio.respostas[0][0])
+
+                # F2: Backup semanal envia banco.json e persiste ultimo_backup_ts
+                est_pers["ultimo_backup_ts"] = time.time() - (8 * 86400)
+                chamadas = {"n": 0}
+
+                async def sleep_bak(_):
+                    chamadas["n"] += 1
+                    if chamadas["n"] >= 2:
+                        raise asyncio.CancelledError()
+
+                lock = asyncio.Lock()
+                with patch("bot.asyncio.sleep", side_effect=sleep_bak):
+                    await bot._loop_backup_semanal(fake_bot, cfg, est_pers, lock, json_path, est_path, dias=7)
+                self.assertEqual(len(fake_bot.arquivos), 1)
+                self.assertGreater(est_pers["ultimo_backup_ts"], time.time() - 60)
+
+                recarregado = core.carregar_estado_persistente(est_path)
+                self.assertGreater(recarregado["ultimo_backup_ts"], time.time() - 60)
+
+            asyncio.run(rodar())
+
+    def test_painel_visual_dnd_e_falsos_alarmes_link_pc(self):
+        import copy
+
+        # 1. Falsos alarmes dos prints: "Link PC:" e rodapés de grupos não podem acionar \bpc\b
+        banco_pc = copy.deepcopy(core.DADOS_PADRAO)
+        banco_pc["alvos_preco"] = {r"\bpc\b": 2000.0}
+
+        post_ssd = (
+            "🔥 SSD Movespeed 7450 MB/s SSD 2TB\n"
+            "💵 R$ 1.690,00 em 9x sem juros\n"
+            "🎟️ CUPOM: AEMEGA6\n"
+            "✅ Link APP: https://a.aliexpress.com/_c35o20t1\n"
+            "✅ Link PC: https://a.aliexpress.com/_c3jgPjZN\n"
+            "⚡ Grupo de Ofertas - informatica!\nhttps://t.me/TJGOFERTASs"
+        )
+        post_teclado = (
+            "🔥 Freewolf F75 Tri-Mode 4000mAh Teclado Mecânico wireless\n"
+            "💵 R$ 194,00 com cupom: AEMEGA2 + 577 Moedas\n"
+            "✅ Link APP: https://a.aliexpress.com/_c3fhJ0F9\n"
+            "✅ Link PC: https://a.aliexpress.com/_c4Ona8Rz\n"
+        )
+        post_url_pc = "Teclado mecânico R$ 150 https://loja.com.br/produto/teclado-gamer-para-pc"
+        post_pc_real = "PC Gamer Ryzen 5 5600G 16GB SSD R$ 1.850,00 https://www.amazon.com.br/dp/B09V3KXJPB"
+
+        self.assertFalse(core.avaliar_gatilhos(post_ssd, banco_pc)["disparar"])
+        self.assertFalse(core.avaliar_gatilhos(post_teclado, banco_pc)["disparar"])
+        self.assertFalse(core.avaliar_gatilhos(post_url_pc, banco_pc)["disparar"])
+        self.assertTrue(core.avaliar_gatilhos(post_pc_real, banco_pc)["disparar"])
+
+        # 2. Editor visual do período DND (/dnd e callbacks)
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "pausado_ate": None, "inicio": time.time(), "aguardando": None}
+            est_pers = core.carregar_estado_persistente(est_path)
+
+            async def rodar():
+                ev_dnd = FakeEvent("/dnd")
+                await bot.processar_comando_painel(ev_dnd, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Configurar Não Perturbe", ev_dnd.respostas[0][0])
+                self.assertTrue(ev_dnd.respostas[0][1]["buttons"])
+
+                # Botão Início -1h faz 00h -> 23h e Fim +1h faz 07h -> 08h
+                await bot.processar_callback_painel(
+                    FakeCallback("dnd:ini:-1"), banco, cfg, est_run, est_pers, {}, fake_bot, json_path, est_path, log_path
+                )
+                self.assertEqual(banco["nao_perturbe"]["inicio"], 23)
+
+                await bot.processar_callback_painel(
+                    FakeCallback("dnd:fim:1"), banco, cfg, est_run, est_pers, {}, fake_bot, json_path, est_path, log_path
+                )
+                self.assertEqual(banco["nao_perturbe"]["fim"], 8)
+
+                # Atalho preset 22h-06h + toggle off
+                await bot.processar_callback_painel(
+                    FakeCallback("dnd:set:22:6"), banco, cfg, est_run, est_pers, {}, fake_bot, json_path, est_path, log_path
+                )
+                self.assertEqual(banco["nao_perturbe"], {"ativo": True, "inicio": 22, "fim": 6})
+
+                await bot.processar_callback_painel(
+                    FakeCallback("dnd:toggle"), banco, cfg, est_run, est_pers, {}, fake_bot, json_path, est_path, log_path
+                )
+                self.assertFalse(banco["nao_perturbe"]["ativo"])
+
+                # Texto aceita formatos como "/dnd 23h-06h" e "/dnd 22 7"
+                await bot.processar_comando_painel(
+                    FakeEvent("/dnd 23h-06h"), banco, cfg, est_run, est_pers, fake_bot, json_path, log_path
+                )
+                self.assertEqual(banco["nao_perturbe"], {"ativo": True, "inicio": 23, "fim": 6})
+
+                await bot.processar_comando_painel(
+                    FakeEvent("/dnd 22 7"), banco, cfg, est_run, est_pers, fake_bot, json_path, log_path
+                )
+                self.assertEqual(banco["nao_perturbe"], {"ativo": True, "inicio": 22, "fim": 7})
 
             asyncio.run(rodar())
 

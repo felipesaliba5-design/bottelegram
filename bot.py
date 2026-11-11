@@ -44,6 +44,7 @@ from core import (
     gerar_snapshot_estado,
     gerar_url_comparacao,
     hash_curto_chave,
+    host_confiavel,
     identificar_produto,
     ler_ultimas_linhas_log,
     logger,
@@ -51,6 +52,7 @@ from core import (
     migrar_estrutura_dados,
     montar_chave_duplicata,
     montar_mensagem_e_botoes_spec,
+    montar_painel_dnd_spec,
     montar_painel_menu_spec,
     montar_painel_palavras_prio_spec,
     montar_painel_prioridades_spec,
@@ -119,6 +121,7 @@ COMANDOS_BOT_MENU = [
     ("snooze", "Pausar loja temporariamente: /snooze amazon 60"),
     ("simular", "Testar texto de oferta sem enviar em canal"),
     ("ranking", "Ranking de canais por alertas gerados"),
+    ("buscar", "Buscar nos últimos alertas enviados"),
     ("ping", "Testar resposta e latência do bot"),
     ("teste", "Testar alerta com botões e MacroDroid"),
     ("backup", "Baixar backup JSON (envie .json para restaurar)"),
@@ -198,8 +201,8 @@ def _formatar_texto_ajuda():
         "<b>Consultas e Controle:</b>\n"
         "• <code>/lista</code> (<code>/l</code>) — Listas numeradas (para remover pelo número)\n"
         "• <code>/status</code> (<code>/s</code>) — Estatísticas e estado\n"
-        "• <code>/pausar</code> (<code>/p</code> alterna) | <code>/retomar</code> (<code>/r</code>)\n"
-        "• <code>/teste</code> (<code>/t</code>) | <code>/ping</code> | <code>/ultimos</code> (<code>/u</code>) | <code>/logs [30]</code>\n"
+        "• <code>/pausar [min]</code> (<code>/p</code> alterna) | <code>/retomar</code> (<code>/r</code>)\n"
+        "• <code>/teste</code> (<code>/t</code>) | <code>/ping</code> | <code>/ultimos</code> (<code>/u</code>) | <code>/buscar termo</code> | <code>/logs [30]</code>\n"
         "• <code>/ranking</code> (<code>/rank</code>) — Ranking de canais que mais geram alertas\n"
         "• <code>/simular texto</code> (<code>/sim</code>) — Simula extração e regras numa oferta\n"
         "• <code>/snooze amazon 60</code> (ou <code>off</code>) — Silencia uma loja por X min\n"
@@ -215,7 +218,16 @@ def _formatar_texto_ajuda():
     )
 
 
+def _verificar_auto_retomar(estado_runtime):
+    """Retoma monitoramento automaticamente se o tempo de /pausar [min] expirou."""
+    ate = estado_runtime.get("pausado_ate")
+    if estado_runtime.get("pausado") and ate and time.time() >= ate:
+        estado_runtime["pausado"] = False
+        estado_runtime["pausado_ate"] = None
+
+
 def _formatar_texto_status(banco, cfg, estado_runtime, estado_persistente):
+    _verificar_auto_retomar(estado_runtime)
     uptime_min = int((time.time() - estado_runtime["inicio"]) // 60)
     stats = garantir_stats_do_dia(estado_persistente)
     dnd = banco.get("nao_perturbe", {})
@@ -224,7 +236,15 @@ def _formatar_texto_status(banco, cfg, estado_runtime, estado_persistente):
     dnd_txt = f"{dnd.get('inicio', 0):02d}h-{dnd.get('fim', 7):02d}h" if dnd.get("ativo") else "OFF"
     usados_txt = "ON" if filtros.get("bloquear_usados") else "OFF"
     import_txt = "ON" if filtros.get("bloquear_importacao") else "OFF"
-    estado_txt = "⏸️ Pausado" if estado_runtime["pausado"] else "✅ Ativo"
+    if estado_runtime.get("pausado"):
+        ate = estado_runtime.get("pausado_ate")
+        if ate:
+            rest_min = max(1, int((ate - time.time()) // 60) + 1)
+            estado_txt = f"⏸️ Pausado (volta em {rest_min} min)"
+        else:
+            estado_txt = "⏸️ Pausado"
+    else:
+        estado_txt = "✅ Ativo"
     macro_txt = "Ativo" if cfg["URL_MACRODROID"] else "Desativado"
     desc_crit = float(banco.get("desconto_critico", 75) or 75)
     crit_txt = "OFF" if desc_crit >= 100 else f"≥{desc_crit:.0f}%"
@@ -383,8 +403,13 @@ def _executar_add_teto(banco, argumento, caminho_json=ARQUIVO_JSON):
         valida, erro = regex_valida(produto)
         if not valida:
             return False, f"⚠️ Padrão inválido: <code>{html.escape(erro)}</code>"
+        if _regex_generica_demais(produto):
+            return False, "⚠️ Padrão genérico demais: casaria com praticamente toda mensagem."
         min_p, max_p = parsear_faixa_preco(faixa_str)
-        banco["alvos_preco"][produto.lower()] = {"min": min_p, "max": max_p} if min_p > 0 else max_p
+        existentes = [k for k in banco["alvos_preco"] if k.lower() == produto.lower() and k != produto]
+        for k_ant in existentes:
+            del banco["alvos_preco"][k_ant]
+        banco["alvos_preco"][produto] = {"min": min_p, "max": max_p} if min_p > 0 else max_p
         salvar_dados(banco, caminho_json)
         return (
             True,
@@ -494,6 +519,32 @@ def _validar_estrutura_banco(novo):
             if isinstance(novo[chave], bool):
                 raise ValueError(f"'{chave}' inválido")
             float(novo[chave])
+    dnd = novo.get("nao_perturbe")
+    if dnd is not None:
+        for campo_h in ("inicio", "fim"):
+            val_h = dnd.get(campo_h, 0)
+            if isinstance(val_h, bool) or not isinstance(val_h, int) or not (0 <= val_h <= 23):
+                raise ValueError(f"'nao_perturbe.{campo_h}' deve ser hora inteira entre 0 e 23")
+        if "ativo" in dnd and not isinstance(dnd["ativo"], bool):
+            raise ValueError("'nao_perturbe.ativo' deve ser booleano")
+    flt = novo.get("filtros_extras")
+    if flt is not None:
+        for campo_b in ("bloquear_usados", "bloquear_importacao"):
+            if campo_b in flt and not isinstance(flt[campo_b], bool):
+                raise ValueError(f"'filtros_extras.{campo_b}' deve ser booleano")
+    prio = novo.get("prioridades")
+    if prio is not None:
+        for cp in ("teto", "combo"):
+            if cp in prio and prio[cp] not in ("alta", "normal"):
+                raise ValueError(f"'prioridades.{cp}' inválido")
+        if "palavras_altas" in prio and (
+            not isinstance(prio["palavras_altas"], list) or not all(isinstance(x, str) for x in prio["palavras_altas"])
+        ):
+            raise ValueError("'prioridades.palavras_altas' deve ser lista de textos")
+    if novo.get("resumo_hora") is not None:
+        rh = novo["resumo_hora"]
+        if isinstance(rh, bool) or not isinstance(rh, int) or not (0 <= rh <= 23):
+            raise ValueError("'resumo_hora' deve ser inteiro entre 0 e 23 ou null")
 
 
 async def processar_backup_recebido(event, banco, caminho_json=ARQUIVO_JSON):
@@ -755,6 +806,8 @@ async def processar_comando_painel(
         elif cmd_full == "🕘 Histórico":
             cmd_full = "/ultimos"
 
+    _verificar_auto_retomar(estado_runtime)
+
     # 2. Mensagem de texto livre durante wizard ativo
     if not cmd_full.startswith("/"):
         acao_pendente = estado_runtime.get("aguardando")
@@ -766,6 +819,10 @@ async def processar_comando_painel(
                 await event.reply("⌛ O assistente expirou (5 min sem resposta). Toque em ➕ Adicionar para recomeçar.")
                 return
             await _responder_wizard_add(event, estado_runtime, banco, acao_pendente, cmd_full, caminho_json)
+        else:
+            await event.reply(
+                "ℹ️ Nenhuma operação ativa. Use /menu para o painel, /simular [texto] para testar ou /ajuda para comandos."
+            )
         return
 
     tinha_pendencia = bool(estado_runtime.get("aguardando"))
@@ -962,15 +1019,32 @@ async def processar_comando_painel(
         await _enviar_backup(event.reply, bot_client, cfg["MEU_CHAT_ID"], caminho_json=caminho_json)
 
     elif comando == "/pausar":
-        if cmd_original == "/p" and estado_runtime["pausado"]:
+        if cmd_original == "/p" and estado_runtime["pausado"] and not argumento:
             estado_runtime["pausado"] = False
+            estado_runtime["pausado_ate"] = None
             await event.reply("▶️ Monitoramento retomado!")
+        elif argumento:
+            if not argumento.isdigit() or not (1 <= int(argumento) <= 1440):
+                await event.reply(
+                    "⚠️ Informe minutos entre 1 e 1440 (ex.: <code>/pausar 30</code>) ou envie só <code>/pausar</code>.",
+                    parse_mode="html",
+                )
+                return
+            minutos = int(argumento)
+            estado_runtime["pausado"] = True
+            estado_runtime["pausado_ate"] = time.time() + (minutos * 60)
+            await event.reply(
+                f"⏸️ Monitoramento pausado por <b>{minutos} min</b>. Envie <code>/r</code> para voltar antes.",
+                parse_mode="html",
+            )
         else:
             estado_runtime["pausado"] = True
+            estado_runtime["pausado_ate"] = None
             await event.reply("⏸️ Monitoramento pausado. Envie <code>/p</code> ou <code>/r</code> para voltar.", parse_mode="html")
 
     elif comando == "/retomar":
         estado_runtime["pausado"] = False
+        estado_runtime["pausado_ate"] = None
         await event.reply("▶️ Monitoramento retomado!", parse_mode="html")
 
     elif comando == "/addcanal":
@@ -1128,8 +1202,8 @@ async def processar_comando_painel(
         dnd = banco.setdefault("nao_perturbe", {"ativo": True, "inicio": 0, "fim": 7})
         arg = argumento.lower()
         if not arg:
-            st = f"ON ({dnd['inicio']:02d}h às {dnd['fim']:02d}h)" if dnd.get("ativo") else "OFF"
-            await event.reply(f"🌙 Modo Não Perturbe: <b>{st}</b>\nUse <code>/dnd 0-7</code> ou <code>/dnd off</code>.", parse_mode="html")
+            texto, spec = montar_painel_dnd_spec(banco)
+            await event.reply(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
         elif arg in ("off", "desativar", "0"):
             dnd["ativo"] = False
             salvar_dados(banco, caminho_json)
@@ -1139,7 +1213,7 @@ async def processar_comando_painel(
             salvar_dados(banco, caminho_json)
             await event.reply(f"🌙 Modo Não Perturbe ativado: <b>{dnd['inicio']:02d}h às {dnd['fim']:02d}h</b>.", parse_mode="html")
         else:
-            m = re.match(r"^(\d{1,2})\s*[-a]\s*(\d{1,2})$", arg)
+            m = re.match(r"^(\d{1,2})(?:h|:00)?\s*(?:-|a|às|as|\s)\s*(\d{1,2})(?:h|:00)?$", arg)
             if not m:
                 await event.reply("⚠️ Use <code>/dnd 0-7</code>, <code>/dnd 23-7</code> ou <code>/dnd off</code>.", parse_mode="html")
                 return
@@ -1194,6 +1268,26 @@ async def processar_comando_painel(
             await event.reply(f"📊 Resumo diário agendado para as <b>{int(arg):02d}:00</b>.", parse_mode="html")
         else:
             await event.reply("⚠️ Informe uma hora de 0 a 23 (ex.: <code>/resumo 21</code>) ou <code>off</code>.", parse_mode="html")
+
+    elif comando == "/buscar":
+        if not argumento:
+            await event.reply("🔎 Use: <code>/buscar amazon</code> ou <code>/buscar ssd</code>", parse_mode="html")
+            return
+        termo = argumento.lower()
+        achados = [
+            i for i in reversed(estado_persistente.get("ultimos", []))
+            if termo in " ".join(str(i.get(k) or "") for k in ("loja", "motivo", "grupo", "link")).lower()
+        ]
+        if not achados:
+            await event.reply("📭 Nada encontrado nos últimos alertas.")
+        else:
+            linhas = [f"🔎 <b>{len(achados)} resultado(s) para</b> <code>{html.escape(termo)}</code>\n"]
+            for i, it in enumerate(achados[:10], 1):
+                linhas.append(
+                    f"{i}. <b>{html.escape(it.get('hora', '--:--'))}</b> [{html.escape(it.get('loja') or 'Link')}] "
+                    f"<i>{html.escape(it.get('motivo', ''))}</i>\n   {html.escape(it.get('link') or '')}"
+                )
+            await enviar_em_partes_fn(event.reply, "\n".join(linhas), parse_mode="html")
 
     else:
         sugestao = difflib.get_close_matches(comando, sorted(COMANDOS_CONHECIDOS), n=1, cutoff=0.6)
@@ -1406,6 +1500,7 @@ async def processar_callback_painel(
             atualizar_menu = True
         elif acao == "pausa":
             estado_runtime["pausado"] = not estado_runtime["pausado"]
+            estado_runtime["pausado_ate"] = None
             atualizar_menu = True
             toast = "⏸️ Pausado!" if estado_runtime["pausado"] else "▶️ Retomado!"
         elif acao == "dnd":
@@ -1466,6 +1561,48 @@ async def processar_callback_painel(
             except Exception:
                 pass
             await event.answer(toast)
+        return
+
+    # 2b. Ações visuais de Não Perturbe (/dnd)
+    if data.startswith("dnd:"):
+        partes = data.split(":")
+        sub = partes[1]
+        dnd = banco.setdefault("nao_perturbe", {"ativo": True, "inicio": 0, "fim": 7})
+        toast = "Atualizado!"
+
+        if sub == "main":
+            texto, spec = montar_painel_dnd_spec(banco)
+            try:
+                await event.edit(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+            except Exception:
+                pass
+            await event.answer()
+            return
+
+        if sub == "toggle":
+            dnd["ativo"] = not dnd.get("ativo", False)
+            toast = f"🌙 DND {'ativado' if dnd['ativo'] else 'desativado'}!"
+        elif sub == "ini" and len(partes) >= 3:
+            delta = int(partes[2])
+            dnd["inicio"] = (int(dnd.get("inicio", 0)) + delta) % 24
+            toast = f"Início: {dnd['inicio']:02d}h"
+        elif sub == "fim" and len(partes) >= 3:
+            delta = int(partes[2])
+            dnd["fim"] = (int(dnd.get("fim", 7)) + delta) % 24
+            toast = f"Fim: {dnd['fim']:02d}h"
+        elif sub == "set" and len(partes) >= 4:
+            ini, fim = int(partes[2]), int(partes[3])
+            if 0 <= ini <= 23 and 0 <= fim <= 23:
+                dnd.update({"ativo": True, "inicio": ini, "fim": fim})
+                toast = f"🌙 {ini:02d}h–{fim:02d}h ativado!"
+
+        salvar_dados(banco, caminho_json)
+        texto, spec = montar_painel_dnd_spec(banco)
+        try:
+            await event.edit(texto, parse_mode="html", buttons=converter_botoes_telethon(spec))
+        except Exception:
+            pass
+        await event.answer(toast)
         return
 
     # 3. Ações de Prioridades e Faixas (/prioridade)
@@ -1691,18 +1828,56 @@ async def _loop_resumo_diario(
 
             agora_dt = datetime.datetime.now()
             hoje = agora_dt.date().isoformat()
-            stats = garantir_stats_do_dia(estado_persistente, hoje)
 
             if agora_dt.hour == int(resumo_hora) and estado_persistente.get("ultimo_resumo_data") != hoje:
-                texto = formatar_resumo_diario(stats, agora_dt.strftime("%d/%m/%Y"))
+                stats_atual = estado_persistente.get("stats_dia", {})
+                data_ant = stats_atual.get("data", "")
+                if int(resumo_hora) == 0 and data_ant and data_ant != hoje:
+                    data_fmt = datetime.date.fromisoformat(data_ant).strftime("%d/%m/%Y")
+                    texto = formatar_resumo_diario(stats_atual, data_fmt)
+                    garantir_stats_do_dia(estado_persistente, hoje)
+                else:
+                    stats = garantir_stats_do_dia(estado_persistente, hoje)
+                    texto = formatar_resumo_diario(stats, agora_dt.strftime("%d/%m/%Y"))
                 await bot_client.send_message(cfg["MEU_CHAT_ID"], texto, parse_mode="html", silent=True)
                 estado_persistente["ultimo_resumo_data"] = hoje
                 await _persistir_estado_async(estado_persistente, caminho_estado, save_lock)
                 logger.info("Resumo diário enviado (%s).", hoje)
+            else:
+                garantir_stats_do_dia(estado_persistente, hoje)
         except asyncio.CancelledError:
             break
         except Exception as err:
             logger.warning("Erro no loop de resumo diário: %s", err)
+
+
+async def _loop_backup_semanal(
+    bot_client,
+    cfg,
+    estado_persistente,
+    save_lock=None,
+    caminho_json=ARQUIVO_JSON,
+    caminho_estado=ARQUIVO_ESTADO,
+    dias=7,
+):
+    """Envia o banco_de_dados.json ao chat automaticamente a cada N dias."""
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            if time.time() - estado_persistente.get("ultimo_backup_ts", 0.0) >= dias * 86400 and os.path.exists(caminho_json):
+                await bot_client.send_file(
+                    cfg["MEU_CHAT_ID"],
+                    caminho_json,
+                    caption="💾 Backup semanal automático (envie este .json aqui para restaurar).",
+                    silent=True,
+                )
+                estado_persistente["ultimo_backup_ts"] = time.time()
+                await _persistir_estado_async(estado_persistente, caminho_estado, save_lock)
+                logger.info("Backup semanal automático enviado.")
+        except asyncio.CancelledError:
+            break
+        except Exception as err:
+            logger.warning("Erro no backup semanal: %s", err)
 
 
 async def _loop_sentinela(bot_client, cfg, banco, estado_runtime, limite_horas=3.0, intervalo=300):
@@ -1794,6 +1969,7 @@ async def processar_mensagem_cacador(
     caminho_estado=ARQUIVO_ESTADO,
 ):
     """Processa uma mensagem/edição recebida de canal monitorado."""
+    _verificar_auto_retomar(estado_runtime)
     if estado_runtime.get("pausado") or getattr(event, "is_private", False) or getattr(event, "out", False):
         return
 
@@ -1870,12 +2046,14 @@ async def processar_mensagem_cacador(
         return
 
     chave_unica = montar_chave_duplicata(info_produto, link_para_abrir or link_bruto, motivo, texto_bruto)
+    chave_alta = f"{chave_unica}#alta"
     chave_curto = hash_curto_chave(chave_unica)
-    if esta_no_historico(estado_persistente, chave_unica, agora) or esta_no_historico(
+    chave_checagem = chave_alta if prioridade == "alta" else chave_unica
+    if esta_no_historico(estado_persistente, chave_checagem, agora) or esta_no_historico(
         estado_persistente, f"sil_hash:{chave_curto}", agora
     ):
         stats["duplicatas_barradas"] += 1
-        logger.info("Duplicata/silenciada ignorada [%s]: chave=%s (%s)", nome_grupo, chave_unica, motivo)
+        logger.info("Duplicata/silenciada ignorada [%s]: chave=%s (%s)", nome_grupo, chave_checagem, motivo)
         return
 
     registrar_historico(
@@ -1886,6 +2064,15 @@ async def processar_mensagem_cacador(
         agora,
         salvar=False,
     )
+    if prioridade == "alta":
+        registrar_historico(
+            estado_persistente,
+            chave_alta,
+            cfg["TEMPO_DUPLICATA"],
+            caminho_estado,
+            agora,
+            salvar=False,
+        )
     if chave_curto in mapa_silenciar:
         del mapa_silenciar[chave_curto]
     elif len(mapa_silenciar) >= 1000:
@@ -1926,25 +2113,25 @@ async def processar_mensagem_cacador(
         nome_grupo, prioridade, motivo, chave_unica, info_produto.get("loja"), link_para_abrir, cupons,
     )
 
-    if (
-        prioridade == "alta"
-        and cfg["URL_MACRODROID"]
-        and link_para_abrir
-        and (agora - estado_runtime.get("ultimo_disparo", 0.0)) >= cfg["TEMPO_DE_ESPERA"]
-    ):
-        cooldown_anterior = estado_runtime.get("ultimo_disparo", 0.0)
-        estado_runtime["ultimo_disparo"] = agora
-        _agendar_bg(
-            _acionar_macrodroid(cfg["URL_MACRODROID"], link_para_abrir, estado_runtime, cooldown_anterior, agora)
-        )
-        await asyncio.sleep(0)
+    if prioridade == "alta" and cfg["URL_MACRODROID"] and link_para_abrir:
+        if not host_confiavel(link_para_abrir):
+            logger.warning("MacroDroid bloqueado: host não confiável (%s)", link_para_abrir)
+        elif (agora - estado_runtime.get("ultimo_disparo", 0.0)) >= cfg["TEMPO_DE_ESPERA"]:
+            cooldown_anterior = estado_runtime.get("ultimo_disparo", 0.0)
+            estado_runtime["ultimo_disparo"] = agora
+            _agendar_bg(
+                _acionar_macrodroid(cfg["URL_MACRODROID"], link_para_abrir, estado_runtime, cooldown_anterior, agora)
+            )
+            await asyncio.sleep(0)
 
     try:
         sent_msg, foi_foto = await _enviar_alerta_telegram(
             bot_client, user_client, event, cfg["MEU_CHAT_ID"], mensagem, legenda_foto, botoes, silencioso
         )
     except Exception:
-        estado_persistente.get("dedup", {}).pop(chave_unica, None)
+        dedup = estado_persistente.get("dedup", {})
+        dedup.pop(chave_unica, None)
+        dedup.pop(chave_alta, None)
         logger.exception("Falha ao entregar alerta [%s] (%s); chave de duplicata liberada.", nome_grupo, motivo)
         return
 
@@ -2002,6 +2189,7 @@ async def main():
     estado_runtime = {
         "ultimo_disparo": 0.0,
         "pausado": False,
+        "pausado_ate": None,
         "inicio": agora_inicio,
         "aguardando": None,
         "aguardando_ate": None,
@@ -2074,6 +2262,9 @@ async def main():
     )
     tarefa_sentinela = asyncio.create_task(_loop_sentinela(bot_client, cfg, banco, estado_runtime))
     tarefa_digest = asyncio.create_task(_loop_digest_dnd(bot_client, cfg, banco, estado_runtime))
+    tarefa_backup = asyncio.create_task(
+        _loop_backup_semanal(bot_client, cfg, estado_persistente, estado_runtime["save_lock"])
+    )
     try:
         await asyncio.gather(
             user_client.run_until_disconnected(),
@@ -2083,6 +2274,7 @@ async def main():
         tarefa_resumo.cancel()
         tarefa_sentinela.cancel()
         tarefa_digest.cancel()
+        tarefa_backup.cancel()
         salvar_estado_persistente(estado_persistente, ARQUIVO_ESTADO)
         await user_client.disconnect()
         await bot_client.disconnect()
