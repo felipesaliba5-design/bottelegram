@@ -79,7 +79,10 @@ Ao iniciar, o bot registra os comandos automaticamente no menu `/` do Telegram. 
 | `/ajuda` (`/h`) | Lista todos os comandos e atalhos |
 | `/lista` (`/l`) | Mostra listas numeradas (para remover pelo número) |
 | `/status` (`/s`) | Estado atual, tempo online e estatísticas do dia |
+| `/ping` | Verifica se o bot está vivo na VPS/Termux e mede a latência |
 | `/teste` (`/t`) | Envia alerta simulado com botões e testa o MacroDroid |
+| `/simular` (`/sim texto`) | Simula extração (preço, desconto, parcelamento, cupom) e mostra se a regra dispararia |
+| `/snooze` (`amazon 60`, `off`) | Silencia alertas de uma loja temporariamente sem afetar as demais |
 | `/ultimos` (`/u`) | Exibe os últimos 10 alertas enviados |
 | `/logs [30]` | Mostra as últimas linhas de `logs/bot.log` |
 | `/backup` (`/b`) | Envia o `banco_de_dados.json` no chat (envie um `.json` de volta para restaurar) |

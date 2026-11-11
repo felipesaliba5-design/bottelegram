@@ -26,6 +26,7 @@ from core import (
     carregar_configuracoes,
     carregar_dados,
     carregar_estado_persistente,
+    detectar_desconto_real,
     disparar_macrodroid,
     eh_horario_dnd,
     escolher_link_oferta,
@@ -33,15 +34,19 @@ from core import (
     expandir_link,
     extrair_cupons,
     extrair_links_mensagem,
+    extrair_parcelamento,
+    extrair_preco,
     formatar_faixa_preco,
     formatar_lista_numerada,
     formatar_resumo_diario,
     garantir_stats_do_dia,
+    gerar_snapshot_estado,
     gerar_url_comparacao,
     hash_curto_chave,
     identificar_produto,
     ler_ultimas_linhas_log,
     logger,
+    loja_em_snooze,
     migrar_estrutura_dados,
     montar_chave_duplicata,
     montar_mensagem_e_botoes_spec,
@@ -51,6 +56,7 @@ from core import (
     montar_wizard_categoria_spec,
     montar_wizard_remover_itens_spec,
     normalizar_faixa_preco,
+    normalizar_loja_snooze,
     palavra_eh_alta,
     parsear_comando_composto,
     parsear_faixa_preco,
@@ -88,6 +94,7 @@ ALIASES_COMANDO = {
     "/u": "/ultimos",
     "/b": "/backup",
     "/res": "/resumo",
+    "/sim": "/simular",
 }
 
 COMANDOS_BOT_MENU = [
@@ -107,6 +114,9 @@ COMANDOS_BOT_MENU = [
     ("delcanal", "Remover canal por nº ou nome: /dc 1"),
     ("dnd", "Modo madrugada: /dnd 0-7 ou off"),
     ("filtro", "Filtros usados/importação"),
+    ("snooze", "Pausar loja temporariamente: /snooze amazon 60"),
+    ("simular", "Testar texto de oferta sem enviar em canal"),
+    ("ping", "Testar resposta e latência do bot"),
     ("teste", "Testar alerta com botões e MacroDroid"),
     ("backup", "Baixar backup JSON (envie .json para restaurar)"),
     ("ajuda", "Ver todos os comandos e atalhos"),
@@ -159,7 +169,9 @@ def _formatar_texto_ajuda():
         "• <code>/lista</code> (<code>/l</code>) — Listas numeradas (para remover pelo número)\n"
         "• <code>/status</code> (<code>/s</code>) — Estatísticas e estado\n"
         "• <code>/pausar</code> (<code>/p</code> alterna) | <code>/retomar</code> (<code>/r</code>)\n"
-        "• <code>/teste</code> (<code>/t</code>) | <code>/ultimos</code> (<code>/u</code>) | <code>/logs [30]</code>\n"
+        "• <code>/teste</code> (<code>/t</code>) | <code>/ping</code> | <code>/ultimos</code> (<code>/u</code>) | <code>/logs [30]</code>\n"
+        "• <code>/simular texto</code> (<code>/sim</code>) — Simula extração e regras numa oferta\n"
+        "• <code>/snooze amazon 60</code> (ou <code>off</code>) — Silencia uma loja por X min\n"
         "• <code>/backup</code> (<code>/b</code>) — Baixar JSON (envie um <code>.json</code> para restaurar)\n\n"
         "<b>Edição Rápida (aceita lote com <code>;</code> e remoção por nº):</b>\n"
         "• <code>/ac @c1 @c2</code> | <code>/dc 1</code> (canais)\n"
@@ -695,6 +707,131 @@ async def processar_comando_painel(
     elif comando == "/teste":
         await _executar_teste_sistema(event.reply, cfg)
 
+    elif comando == "/ping":
+        inicio_ping = time.perf_counter()
+        msg_ping = await event.reply("🏓 Pong!")
+        latencia_ms = (time.perf_counter() - inicio_ping) * 1000.0
+        try:
+            await msg_ping.edit(f"🏓 <b>Pong!</b> Latência: <code>{latencia_ms:.0f} ms</code>", parse_mode="html")
+        except Exception:
+            pass
+
+    elif comando == "/snooze":
+        snooze_lojas = estado_runtime.setdefault("snooze_lojas", {})
+        agora = time.time()
+        for k in [k for k, v in snooze_lojas.items() if v <= agora]:
+            del snooze_lojas[k]
+
+        if not argumento:
+            if not snooze_lojas:
+                await event.reply(
+                    "😴 Nenhuma loja em snooze.\nUse: <code>/snooze amazon 60</code> (ou <code>shopee 120</code>)",
+                    parse_mode="html",
+                )
+            else:
+                linhas = ["😴 <b>Lojas em Snooze:</b>"]
+                for loja_k, exp in snooze_lojas.items():
+                    rest_min = max(1, int((exp - agora) // 60) + 1)
+                    linhas.append(f"• <b>{html.escape(loja_k.title())}</b>: {rest_min} min restantes")
+                linhas.append("\nPara cancelar: <code>/snooze off</code> ou <code>/snooze loja off</code>")
+                await event.reply("\n".join(linhas), parse_mode="html")
+            return
+
+        tokens = argumento.split()
+        if tokens[0].lower() in ("off", "limpar", "cancelar"):
+            snooze_lojas.clear()
+            await event.reply("🔔 Todos os snoozes de lojas foram cancelados.")
+            return
+
+        if len(tokens) >= 2 and (tokens[-1].lower() in ("off", "0") or tokens[-1].isdigit() or re.fullmatch(r"-\d+", tokens[-1])):
+            loja = normalizar_loja_snooze(" ".join(tokens[:-1]))
+            sufixo = tokens[-1]
+        else:
+            loja = normalizar_loja_snooze(" ".join(tokens))
+            sufixo = None
+
+        if not loja:
+            await event.reply("⚠️ Informe o nome da loja (ex.: <code>/snooze amazon 60</code>).", parse_mode="html")
+            return
+
+        if sufixo is not None and sufixo.lower() in ("off", "0"):
+            if snooze_lojas.pop(loja, None) is not None:
+                await event.reply(f"🔔 Snooze cancelado para <b>{html.escape(loja.title())}</b>.", parse_mode="html")
+            else:
+                await event.reply(f"ℹ️ <b>{html.escape(loja.title())}</b> não estava em snooze.", parse_mode="html")
+            return
+
+        minutos = 60
+        if sufixo is not None:
+            if not sufixo.isdigit() or not (1 <= int(sufixo) <= 1440):
+                await event.reply("⚠️ Informe minutos entre 1 e 1440 (ex.: <code>/snooze amazon 60</code>).", parse_mode="html")
+                return
+            minutos = int(sufixo)
+
+        snooze_lojas[loja] = agora + (minutos * 60)
+        await event.reply(f"😴 <b>{html.escape(loja.title())}</b> silenciada por <b>{minutos} min</b>.", parse_mode="html")
+
+    elif comando == "/simular":
+        if not argumento:
+            await event.reply(
+                "🧪 <b>Simulador de Regras</b>\n"
+                "Envie: <code>/simular [texto da oferta]</code> para testar preço, desconto, parcelamento, cupons e gatilhos.",
+                parse_mode="html",
+            )
+            return
+        preco_sim = extrair_preco(argumento)
+        desc_sim = detectar_desconto_real(argumento, banco.get("desconto_minimo", 0))
+        cupons_sim = extrair_cupons(argumento)
+        parcel_sim = extrair_parcelamento(argumento)
+        links_sim = extrair_links_mensagem(
+            argumento, getattr(event, "entities", None), text_url_cls=MessageEntityTextUrl
+        )
+        link_sim = escolher_link_oferta(links_sim)
+        info_sim = identificar_produto(link_sim) if link_sim else {"loja": None}
+        avaliacao_sim = avaliar_gatilhos(argumento, banco)
+
+        prioridade_sim = avaliacao_sim.get("prioridade")
+        notas_envio = []
+        if avaliacao_sim["disparar"]:
+            if prioridade_sim != "alta" and eh_horario_dnd(banco.get("nao_perturbe")):
+                notas_envio.append("segurado pelo DND agora")
+            loja_snz = loja_em_snooze(info_sim, link_sim, estado_runtime.get("snooze_lojas", {}))
+            if loja_snz:
+                notas_envio.append(f"em snooze ({loja_snz})")
+
+        status_sim = "✅ DISPARARIA" if avaliacao_sim["disparar"] else "🛑 IGNORADO / BLOQUEADO"
+        if notas_envio:
+            status_sim = f"⏸️ {status_sim} ({', '.join(notas_envio)})"
+
+        prio_txt = (prioridade_sim or "nenhuma").upper()
+        if prioridade_sim == "alta":
+            prio_txt = "🔴 ALTA (som + MacroDroid)"
+        elif prioridade_sim == "normal":
+            prio_txt = "🟡 NORMAL (silencioso)"
+
+        preco_txt = f"R$ {preco_sim:.2f}" if preco_sim is not None else "Não detectado"
+        desc_txt = (
+            f"{desc_sim[0]:.0f}% (R$ {desc_sim[1]:.2f} → R$ {desc_sim[2]:.2f})"
+            if desc_sim
+            else "Não detectado"
+        )
+        cupons_txt = ", ".join(f"<code>{html.escape(c)}</code>" for c in cupons_sim) if cupons_sim else "Nenhum"
+        parcel_txt = html.escape(parcel_sim) if parcel_sim else "Não detectado"
+        loja_txt = html.escape(info_sim.get("loja")) if info_sim.get("loja") else "Não identificada"
+
+        await event.reply(
+            f"🧪 <b>Resultado da Simulação</b>\n\n"
+            f"• <b>Decisão:</b> {status_sim}\n"
+            f"• <b>Motivo:</b> <code>{html.escape(avaliacao_sim['motivo'])}</code>\n"
+            f"• <b>Prioridade:</b> <b>{prio_txt}</b>\n"
+            f"• <b>Loja:</b> {loja_txt}\n"
+            f"• <b>Preço extraído:</b> {preco_txt}\n"
+            f"• <b>Desconto real:</b> {desc_txt}\n"
+            f"• <b>Parcelamento:</b> {parcel_txt}\n"
+            f"• <b>Cupons:</b> {cupons_txt}",
+            parse_mode="html",
+        )
+
     elif comando == "/ultimos":
         await _enviar_ultimos(event.reply, estado_persistente)
 
@@ -1159,6 +1296,10 @@ async def processar_callback_painel(
             salvar_dados(banco, caminho_json)
             atualizar_menu = True
             toast = f"✈️ Filtro importação {'ON' if flt['bloquear_importacao'] else 'OFF'}"
+        elif acao == "limpar_snooze":
+            estado_runtime.setdefault("snooze_lojas", {}).clear()
+            atualizar_menu = True
+            toast = "🔔 Snoozes limpos!"
         elif acao == "lista":
             await event.answer()
             await enviar_em_partes_fn(send_chat, _formatar_lista_painel(banco, estado_runtime), parse_mode="html")
@@ -1340,6 +1481,17 @@ async def _enviar_alerta_telegram(
         return sent, False
 
 
+async def _persistir_estado_async(estado_persistente, caminho_estado=ARQUIVO_ESTADO, lock=None):
+    """Gera cópia isolada do estado no event loop e grava em disco via thread sem bloquear."""
+    if lock is None:
+        snapshot = gerar_snapshot_estado(estado_persistente)
+        await asyncio.to_thread(salvar_estado_persistente, snapshot, caminho_estado)
+        return
+    async with lock:
+        snapshot = gerar_snapshot_estado(estado_persistente)
+        await asyncio.to_thread(salvar_estado_persistente, snapshot, caminho_estado)
+
+
 async def _enriquecer_alerta_vago(sent_msg, foi_foto, contexto_msg):
     """Para posts vagos, busca o título real da página e edita o alerta logo após o envio."""
     url = contexto_msg.get("link_oferta")
@@ -1349,7 +1501,8 @@ async def _enriquecer_alerta_vago(sent_msg, foi_foto, contexto_msg):
         meta = await asyncio.to_thread(buscar_metadados_pagina, url)
         titulo = meta.get("titulo")
         preco = meta.get("preco")
-        if not titulo and not preco:
+        mostrar_buscando = bool(contexto_msg.get("buscando_titulo"))
+        if not titulo and not preco and not mostrar_buscando:
             return
 
         url_comp = contexto_msg.get("url_comparacao") or gerar_url_comparacao(
@@ -1374,6 +1527,7 @@ async def _enriquecer_alerta_vago(sent_msg, foi_foto, contexto_msg):
             chave_silenciar=contexto_msg["chave_curta"],
             tipo_gatilho=contexto_msg.get("tipo_gatilho"),
             alvo_gatilho=contexto_msg.get("alvo_gatilho"),
+            buscando_titulo=False,
         )
         await sent_msg.edit(
             legenda_nova if foi_foto else msg_nova,
@@ -1381,13 +1535,23 @@ async def _enriquecer_alerta_vago(sent_msg, foi_foto, contexto_msg):
             buttons=converter_botoes_telethon(botoes_spec),
             link_preview=False,
         )
-        logger.info("Alerta vago atualizado com título: %s", titulo)
+        if titulo or preco:
+            logger.info("Alerta vago atualizado com título: %s", titulo)
+        else:
+            logger.debug("Aviso de carregamento removido de alerta vago sem metadados.")
     except Exception as err:
         logger.debug("Não foi possível editar alerta vago: %s", err)
 
 
-async def _loop_resumo_diario(bot_client, cfg, banco, estado_persistente):
-    """Envia o resumo diário automaticamente no horário configurado."""
+async def _loop_resumo_diario(
+    bot_client,
+    cfg,
+    banco,
+    estado_persistente,
+    save_lock=None,
+    caminho_estado=ARQUIVO_ESTADO,
+):
+    """Envia o resumo diário automaticamente no horário configurado sem bloquear o event loop."""
     while True:
         try:
             await asyncio.sleep(30)
@@ -1403,7 +1567,7 @@ async def _loop_resumo_diario(bot_client, cfg, banco, estado_persistente):
                 texto = formatar_resumo_diario(stats, agora_dt.strftime("%d/%m/%Y"))
                 await bot_client.send_message(cfg["MEU_CHAT_ID"], texto, parse_mode="html", silent=True)
                 estado_persistente["ultimo_resumo_data"] = hoje
-                salvar_estado_persistente(estado_persistente, ARQUIVO_ESTADO)
+                await _persistir_estado_async(estado_persistente, caminho_estado, save_lock)
                 logger.info("Resumo diário enviado (%s).", hoje)
         except asyncio.CancelledError:
             break
@@ -1439,6 +1603,8 @@ async def main():
         "pausado": False,
         "inicio": time.time(),
         "aguardando": None,
+        "snooze_lojas": {},
+        "save_lock": asyncio.Lock(),
     }
 
     sessao_user = os.path.join(BASE_DIR, "sessao_bot")
@@ -1502,6 +1668,9 @@ async def main():
         links_atuais = extrair_links_mensagem(texto_bruto, event.entities, text_url_cls=MessageEntityTextUrl)
         if links_atuais:
             memoria_canais[chat_id] = {"raw_text": texto_bruto, "links": links_atuais, "tempo": agora}
+            chaves_expiradas = [k for k, v in memoria_canais.items() if (agora - v["tempo"]) > 300]
+            for k in chaves_expiradas:
+                del memoria_canais[k]
 
         avaliacao = avaliar_gatilhos(texto_bruto, banco)
         nome_grupo = getattr(chat, "title", canal_username or chat_id)
@@ -1523,6 +1692,16 @@ async def main():
             await _resolver_link_e_produto(links_atuais, chat_id, agora, memoria_canais)
         )
 
+        loja_pausada = loja_em_snooze(
+            info_produto,
+            link_para_abrir or link_bruto,
+            estado_runtime.get("snooze_lojas", {}),
+            agora,
+        )
+        if loja_pausada:
+            logger.info("Snooze ativo [%s] para loja '%s': %s", nome_grupo, loja_pausada, motivo)
+            return
+
         chave_unica = montar_chave_duplicata(info_produto, link_para_abrir or link_bruto, motivo, texto_bruto)
         chave_curto = hash_curto_chave(chave_unica)
         if esta_no_historico(estado_persistente, chave_unica, agora) or esta_no_historico(
@@ -1532,7 +1711,18 @@ async def main():
             logger.info("Duplicata/silenciada ignorada [%s]: chave=%s (%s)", nome_grupo, chave_unica, motivo)
             return
 
-        registrar_historico(estado_persistente, chave_unica, cfg["TEMPO_DUPLICATA"], ARQUIVO_ESTADO, agora)
+        registrar_historico(
+            estado_persistente,
+            chave_unica,
+            cfg["TEMPO_DUPLICATA"],
+            ARQUIVO_ESTADO,
+            agora,
+            salvar=False,
+        )
+        if chave_curto in mapa_silenciar:
+            del mapa_silenciar[chave_curto]
+        elif len(mapa_silenciar) >= 1000:
+            del mapa_silenciar[next(iter(mapa_silenciar))]
         mapa_silenciar[chave_curto] = chave_unica
 
         if username:
@@ -1543,6 +1733,7 @@ async def main():
 
         cupons = extrair_cupons(f"{texto_bruto}\n{texto_recuperado or ''}")
         url_comparacao = gerar_url_comparacao(info_produto, texto_bruto, link_para_abrir)
+        buscando_titulo = alerta_eh_vago(texto_bruto) and bool(link_para_abrir)
         mensagem, legenda_foto, botoes_spec = montar_mensagem_e_botoes_spec(
             nome_grupo=nome_grupo,
             motivo_disparo=motivo,
@@ -1558,6 +1749,7 @@ async def main():
             chave_silenciar=chave_curto,
             tipo_gatilho=avaliacao.get("tipo_gatilho"),
             alvo_gatilho=avaliacao.get("alvo_gatilho"),
+            buscando_titulo=buscando_titulo,
         )
         botoes = converter_botoes_telethon(botoes_spec)
         silencioso = prioridade != "alta"
@@ -1582,9 +1774,11 @@ async def main():
                 "link": link_para_abrir or link_origem,
             },
             ARQUIVO_ESTADO,
+            salvar=False,
         )
+        await _persistir_estado_async(estado_persistente, ARQUIVO_ESTADO, estado_runtime.get("save_lock"))
 
-        if alerta_eh_vago(texto_bruto) and link_para_abrir and sent_msg is not None:
+        if buscando_titulo and sent_msg is not None:
             asyncio.create_task(
                 _enriquecer_alerta_vago(
                     sent_msg,
@@ -1604,6 +1798,7 @@ async def main():
                         "chave_curta": chave_curto,
                         "tipo_gatilho": avaliacao.get("tipo_gatilho"),
                         "alvo_gatilho": avaliacao.get("alvo_gatilho"),
+                        "buscando_titulo": buscando_titulo,
                     },
                 )
             )
@@ -1637,7 +1832,9 @@ async def main():
     except Exception as err:
         logger.warning("Não foi possível enviar aviso de inicialização: %s", err)
 
-    tarefa_resumo = asyncio.create_task(_loop_resumo_diario(bot_client, cfg, banco, estado_persistente))
+    tarefa_resumo = asyncio.create_task(
+        _loop_resumo_diario(bot_client, cfg, banco, estado_persistente, estado_runtime["save_lock"])
+    )
     try:
         await asyncio.gather(
             user_client.run_until_disconnected(),

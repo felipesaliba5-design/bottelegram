@@ -104,9 +104,13 @@ class FakeEvent:
         self.file = types.SimpleNamespace(name=file_name) if file_name else None
         self._doc_bytes = doc_bytes
         self.respostas = []
+        self.mensagens_enviadas = []
 
     async def reply(self, text, **kwargs):
         self.respostas.append((text, kwargs))
+        msg = FakeSentMessage(text, kwargs)
+        self.mensagens_enviadas.append(msg)
+        return msg
 
     async def download_media(self, file=bytes):
         return self._doc_bytes
@@ -145,6 +149,23 @@ class FakeSentMessage:
 
     async def edit(self, text, **kwargs):
         self.edicoes.append((text, kwargs))
+
+
+class FakeCallback:
+    def __init__(self, data, sender_id=777):
+        self.data = data.encode("utf-8")
+        self.sender_id = sender_id
+        self.edicoes = []
+        self.answers = []
+
+    async def edit(self, text=None, **kwargs):
+        self.edicoes.append((text, kwargs))
+
+    async def answer(self, text="", **kwargs):
+        self.answers.append((text, kwargs))
+
+    async def get_message(self):
+        return types.SimpleNamespace(buttons=[])
 
 
 class BotTests(unittest.TestCase):
@@ -658,6 +679,315 @@ class BotTests(unittest.TestCase):
                     ev_b = FakeEvent(txt_btn)
                     await bot.processar_comando_painel(ev_b, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
                     self.assertTrue(ev_b.respostas)
+
+            asyncio.run(rodar())
+
+    def test_ping_e_snooze_lojas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "inicio": time.time(), "aguardando": None, "snooze_lojas": {}}
+            est_pers = core.carregar_estado_persistente(est_path)
+
+            async def rodar():
+                ev_ping = FakeEvent("/ping")
+                await bot.processar_comando_painel(ev_ping, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Pong", ev_ping.respostas[0][0])
+                self.assertTrue(ev_ping.mensagens_enviadas[0].edicoes)
+                self.assertIn("ms", ev_ping.mensagens_enviadas[0].edicoes[0][0])
+
+                ev_snz_vazio = FakeEvent("/snooze")
+                await bot.processar_comando_painel(ev_snz_vazio, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Nenhuma loja em snooze", ev_snz_vazio.respostas[0][0])
+
+                ev_amz = FakeEvent("/snooze amazon 60")
+                await bot.processar_comando_painel(ev_amz, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("amazon", est_run["snooze_lojas"])
+
+                ev_ml = FakeEvent("/snooze ml 30")
+                await bot.processar_comando_painel(ev_ml, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("mercado livre", est_run["snooze_lojas"])
+
+                ev_ml2 = FakeEvent("/snooze mercado livre 45")
+                await bot.processar_comando_painel(ev_ml2, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("45 min", ev_ml2.respostas[0][0])
+
+                ev_off_amz = FakeEvent("/snooze amazon off")
+                await bot.processar_comando_painel(ev_off_amz, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertNotIn("amazon", est_run["snooze_lojas"])
+                self.assertIn("mercado livre", est_run["snooze_lojas"])
+
+                ev_off = FakeEvent("/snooze off")
+                await bot.processar_comando_painel(ev_off, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(est_run["snooze_lojas"], {})
+
+            asyncio.run(rodar())
+
+            agora = 1000.0
+            ativos = {"amazon": agora + 120.0}
+            # Mesmo com loja=None, não pode lançar AttributeError
+            self.assertIsNone(core.loja_em_snooze({"loja": None}, "https://amzn.to/abc", ativos, agora))
+            self.assertEqual(core.loja_em_snooze({"loja": None}, "https://www.amazon.com.br/dp/B0123", ativos, agora), "amazon")
+            self.assertEqual(core.loja_em_snooze({"loja": "Amazon"}, "", ativos, agora), "amazon")
+            # Expirado é limpo automaticamente
+            self.assertIsNone(core.loja_em_snooze({"loja": "Amazon"}, "", ativos, agora + 200.0))
+            self.assertEqual(ativos, {})
+
+    def test_barra_progresso_resumo_e_aviso_buscando_vago(self):
+        self.assertEqual(core.barra_progresso(0, 100), "⬜⬜⬜⬜⬜")
+        self.assertEqual(core.barra_progresso(1, 100), "🟩⬜⬜⬜⬜")
+        self.assertEqual(core.barra_progresso(60, 100), "🟩🟩🟩⬜⬜")
+        self.assertEqual(core.barra_progresso(100, 100), "🟩🟩🟩🟩🟩")
+
+        resumo = core.formatar_resumo_diario({
+            "data": "2026-11-11",
+            "mensagens_lidas": 100,
+            "alertas_enviados": 2,
+            "duplicatas_barradas": 40,
+            "bloqueios_negativos": 20,
+            "bloqueios_dnd": 1,
+        })
+        self.assertIn("🟩⬜⬜⬜⬜", resumo)
+        self.assertIn("🟩🟩⬜⬜⬜", resumo)
+
+        msg_inicial, _, _ = core.montar_mensagem_e_botoes_spec(
+            nome_grupo="Canal",
+            motivo_disparo="Palavra-Chave",
+            prioridade="alta",
+            texto_bruto="CORRE BUG https://amzn.to/abc",
+            cupons=[],
+            info_produto={"loja": None, "produto_id": None, "link_limpo": "https://amzn.to/abc", "carrinho_amazon": None},
+            link_oferta="https://amzn.to/abc",
+            link_origem="https://t.me/canal/1",
+            links_extras=[],
+            buscando_titulo=True,
+        )
+        self.assertIn("Buscando título e preço do produto...", msg_inicial)
+
+        class EmptyMetaHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"<html><body><p>Sem titulo</p></body></html>")
+
+            def log_message(self, format, *args):
+                return
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), EmptyMetaHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/vazio"
+            sent = FakeSentMessage(msg_inicial, {})
+            ctx = {
+                "nome_grupo": "Canal",
+                "motivo_disparo": "Palavra-Chave",
+                "prioridade": "alta",
+                "texto_bruto": f"CORRE BUG {url}",
+                "cupons": [],
+                "info_produto": {"loja": None, "produto_id": None, "link_limpo": url, "carrinho_amazon": None},
+                "link_oferta": url,
+                "link_origem": "https://t.me/canal/1",
+                "links_extras": [url],
+                "texto_recuperado": None,
+                "url_comparacao": None,
+                "chave_curta": "abcdef123456",
+                "buscando_titulo": True,
+            }
+            asyncio.run(bot._enriquecer_alerta_vago(sent, False, ctx))
+            self.assertEqual(len(sent.edicoes), 1)
+            self.assertNotIn("Buscando título e preço do produto...", sent.edicoes[0][0])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_qa_auditoria_colisao_dnd_virada_e_link_invisivel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "inicio": time.time(), "aguardando": None, "save_lock": None}
+            est_pers = core.carregar_estado_persistente(est_path)
+            mapa_sil = {}
+
+            async def rodar_qa():
+                # QA 1: Spam de 15 callbacks simultâneos de prioridade sem erro de escrita
+                antes_p0 = core.palavra_eh_alta(banco, banco["palavras"][0])
+                callbacks = [FakeCallback("prio:w:0:0") for _ in range(15)]
+                await asyncio.gather(*(
+                    bot.processar_callback_painel(
+                        cb, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path
+                    )
+                    for cb in callbacks
+                ))
+                self.assertNotEqual(core.palavra_eh_alta(banco, banco["palavras"][0]), antes_p0)
+                with open(json_path, "r", encoding="utf-8") as f:
+                    self.assertIn("palavras", json.load(f))
+
+                # Persistência assíncrona concorrente sem Race / dictionary changed size
+                lock = asyncio.Lock()
+                core.registrar_historico(est_pers, "chave-1", 300, est_path, time.time(), salvar=False)
+                await asyncio.gather(*(bot._persistir_estado_async(est_pers, est_path, lock) for _ in range(10)))
+                with open(est_path, "r", encoding="utf-8") as f:
+                    self.assertIn("chave-1", json.load(f).get("dedup", {}))
+
+                # QA 2: DND com virada de dia (/dnd 23-2 às 01:00)
+                ev_dnd = FakeEvent("/dnd 23-2")
+                await bot.processar_comando_painel(ev_dnd, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(banco["nao_perturbe"], {"ativo": True, "inicio": 23, "fim": 2})
+
+            asyncio.run(rodar_qa())
+
+            self.assertTrue(core.eh_horario_dnd(banco["nao_perturbe"], datetime.datetime(2026, 11, 11, 23, 30)))
+            self.assertTrue(core.eh_horario_dnd(banco["nao_perturbe"], datetime.datetime(2026, 11, 12, 1, 0)))
+            self.assertFalse(core.eh_horario_dnd(banco["nao_perturbe"], datetime.datetime(2026, 11, 12, 2, 0)))
+            self.assertFalse(core.eh_horario_dnd(banco["nao_perturbe"], datetime.datetime(2026, 11, 12, 15, 0)))
+
+            # QA 3: Link invisível embutido via MessageEntityTextUrl
+            links = core.extrair_links_mensagem(
+                "BUG! Preço errado: Clique aqui",
+                [MessageEntityTextUrl("https://amzn.to/xxxx")],
+                text_url_cls=MessageEntityTextUrl,
+            )
+            self.assertEqual(links, ["https://amzn.to/xxxx"])
+
+    def test_snooze_dominio_netloc_menu_limpar_e_resumo_async(self):
+        agora = 1000.0
+        ativos = {"amazon": agora + 120.0}
+        # Não dá falso positivo quando 'amazon' está só no slug do produto de outra loja
+        self.assertIsNone(
+            core.loja_em_snooze({"loja": None}, "https://www.kabum.com.br/produto/capa-amazon-kindle", ativos, agora)
+        )
+        self.assertEqual(
+            core.loja_em_snooze({"loja": None}, "https://www.amazon.com.br/dp/B0123", ativos, agora),
+            "amazon",
+        )
+        self.assertEqual(
+            core.loja_em_snooze({"loja": None}, "www.amazon.com.br/dp/B0123", ativos, agora),
+            "amazon",
+        )
+
+        # bot_bugs legado carrega sem iniciar cliente e usa sessão separada de sessao_bot
+        import bot_bugs
+
+        self.assertTrue(bot_bugs.sessao_legacy.endswith("sessao_bot_legacy"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            banco["resumo_hora"] = datetime.datetime.now().hour
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {
+                "pausado": False,
+                "inicio": time.time(),
+                "aguardando": None,
+                "snooze_lojas": {"amazon": time.time() + 1800},
+            }
+            est_pers = core.carregar_estado_persistente(est_path)
+
+            texto_menu, spec_menu = core.montar_painel_menu_spec(banco, est_run, est_pers)
+            self.assertIn("Snooze (1)", texto_menu)
+            self.assertEqual(spec_menu[-1][0][2], "menu:limpar_snooze")
+
+            async def rodar():
+                cb_limpar = FakeCallback("menu:limpar_snooze")
+                await bot.processar_callback_painel(
+                    cb_limpar, banco, cfg, est_run, est_pers, {}, fake_bot, json_path, est_path, log_path
+                )
+                self.assertEqual(est_run["snooze_lojas"], {})
+                self.assertNotIn("Snooze", cb_limpar.edicoes[0][0])
+
+                # _loop_resumo_diario envia e persiste via _persistir_estado_async com save_lock
+                from unittest.mock import patch
+
+                chamadas = {"n": 0}
+
+                async def fake_sleep(_):
+                    chamadas["n"] += 1
+                    if chamadas["n"] >= 2:
+                        raise asyncio.CancelledError()
+
+                lock = asyncio.Lock()
+                with patch("bot.asyncio.sleep", side_effect=fake_sleep):
+                    await bot._loop_resumo_diario(fake_bot, cfg, banco, est_pers, save_lock=lock, caminho_estado=est_path)
+
+                self.assertEqual(len(fake_bot.mensagens), 1)
+                self.assertIn("Resumo Diário", fake_bot.mensagens[0][1])
+                with open(est_path, "r", encoding="utf-8") as f:
+                    self.assertEqual(json.load(f).get("ultimo_resumo_data"), datetime.date.today().isoformat())
+
+            asyncio.run(rodar())
+
+    def test_parcelamento_e_comando_simular(self):
+        self.assertEqual(core.extrair_parcelamento("Por R$ 1.299 ou 10x de R$ 129,90 sem juros!"), "10x de R$ 129,90 sem juros")
+        self.assertEqual(core.extrair_parcelamento("Em até 12x R$ 99,90 s/ juros"), "12x R$ 99,90 s/ juros")
+        self.assertEqual(core.extrair_parcelamento("Parcele em 10x sem juros de R$ 120,00"), "10x sem juros de R$ 120,00")
+        self.assertEqual(core.extrair_parcelamento("10x sem juros"), "10x sem juros")
+        self.assertIsNone(core.extrair_parcelamento("À vista 1x sem juros"))
+        self.assertIsNone(core.extrair_parcelamento("Monitor Full HD 1080x1920"))
+
+        msg_parcel, _, _ = core.montar_mensagem_e_botoes_spec(
+            nome_grupo="Canal",
+            motivo_disparo="Queda",
+            prioridade="alta",
+            texto_bruto="Notebook De R$ 4.000 por R$ 1.200 em 10x de R$ 120,00 sem juros",
+            cupons=[],
+            info_produto={"loja": "Amazon", "produto_id": None, "link_limpo": None, "carrinho_amazon": None},
+            link_oferta="https://www.amazon.com.br/dp/B09V3KXJPB",
+            link_origem="https://t.me/canal/1",
+        )
+        self.assertIn("Parcelamento:", msg_parcel)
+        self.assertIn("10x de R$ 120,00 sem juros", msg_parcel)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "inicio": time.time(), "aguardando": None, "snooze_lojas": {}}
+            est_pers = core.carregar_estado_persistente(est_path)
+
+            async def rodar():
+                ev_vazio = FakeEvent("/simular")
+                await bot.processar_comando_painel(ev_vazio, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Simulador de Regras", ev_vazio.respostas[0][0])
+
+                ev_ok = FakeEvent(
+                    "/sim Monitor Gamer De R$ 1.500 por R$ 450 10x sem juros Cupom: TESTE10 https://www.amazon.com.br/dp/B09V3KXJPB"
+                )
+                await bot.processar_comando_painel(ev_ok, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                resp_ok = ev_ok.respostas[0][0]
+                self.assertIn("DISPARARIA", resp_ok)
+                self.assertIn("450.00", resp_ok)
+                self.assertIn("70%", resp_ok)
+                self.assertIn("10x sem juros", resp_ok)
+                self.assertIn("TESTE10", resp_ok)
+                self.assertIn("Amazon", resp_ok)
+
+                est_run["snooze_lojas"]["amazon"] = time.time() + 600
+                ev_snz = FakeEvent("/simular CORRE BUG https://www.amazon.com.br/dp/B09V3KXJPB")
+                await bot.processar_comando_painel(ev_snz, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("em snooze (amazon)", ev_snz.respostas[0][0])
+
+                ev_blk = FakeEvent("/simular esgotado BUG R$ 10")
+                await bot.processar_comando_painel(ev_blk, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("IGNORADO / BLOQUEADO", ev_blk.respostas[0][0])
 
             asyncio.run(rodar())
 

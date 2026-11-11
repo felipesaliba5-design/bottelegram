@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -209,15 +211,36 @@ def carregar_configuracoes(caminho_env=ARQUIVO_ENV):
     }
 
 
+_JSON_LOCK = threading.Lock()
+
+
 def _salvar_json_atomico(dados, caminho_json):
-    """Salva qualquer arquivo JSON de forma atômica via arquivo temporário."""
-    pasta = os.path.dirname(os.path.abspath(caminho_json))
-    if pasta:
-        os.makedirs(pasta, exist_ok=True)
-    caminho_tmp = f"{caminho_json}.tmp"
-    with open(caminho_tmp, "w", encoding="utf-8") as f:
-        json.dump(dados, f, ensure_ascii=False, indent=4)
-    os.replace(caminho_tmp, caminho_json)
+    """Salva qualquer arquivo JSON de forma atômica e segura contra concorrência."""
+    pasta = os.path.dirname(os.path.abspath(caminho_json)) or "."
+    os.makedirs(pasta, exist_ok=True)
+    prefixo = f"{os.path.basename(caminho_json)}."
+    with _JSON_LOCK:
+        caminho_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=pasta,
+                prefix=prefixo,
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                caminho_tmp = f.name
+                json.dump(dados, f, ensure_ascii=False, indent=4)
+                f.flush()
+            os.replace(caminho_tmp, caminho_json)
+        except Exception:
+            if caminho_tmp and os.path.exists(caminho_tmp):
+                try:
+                    os.remove(caminho_tmp)
+                except OSError:
+                    pass
+            raise
 
 
 def salvar_dados(dados, caminho_json=ARQUIVO_JSON):
@@ -316,14 +339,20 @@ def carregar_estado_persistente(caminho_estado=ARQUIVO_ESTADO):
     return base
 
 
-def salvar_estado_persistente(estado_persistente, caminho_estado=ARQUIVO_ESTADO):
-    """Remove entradas expiradas de dedup e salva o estado persistente atomicamente."""
-    agora = time.time()
+def gerar_snapshot_estado(estado_persistente, agora=None):
+    """Limpa entradas expiradas de dedup/ultimos e retorna cópia isolada para I/O em thread."""
+    agora = time.time() if agora is None else agora
     estado_persistente["dedup"] = {
         k: v for k, v in estado_persistente.get("dedup", {}).items() if v > agora
     }
     estado_persistente["ultimos"] = estado_persistente.get("ultimos", [])[-20:]
-    _salvar_json_atomico(estado_persistente, caminho_estado)
+    return copy.deepcopy(estado_persistente)
+
+
+def salvar_estado_persistente(estado_persistente, caminho_estado=ARQUIVO_ESTADO):
+    """Remove entradas expiradas de dedup e salva o estado persistente atomicamente."""
+    snapshot = gerar_snapshot_estado(estado_persistente)
+    _salvar_json_atomico(snapshot, caminho_estado)
 
 
 def esta_no_historico(estado_persistente, chave, agora=None):
@@ -338,17 +367,26 @@ def esta_no_historico(estado_persistente, chave, agora=None):
     return True
 
 
-def registrar_historico(estado_persistente, chave, ttl_segundos, caminho_estado=ARQUIVO_ESTADO, agora=None):
+def registrar_historico(
+    estado_persistente,
+    chave,
+    ttl_segundos,
+    caminho_estado=ARQUIVO_ESTADO,
+    agora=None,
+    salvar=True,
+):
     """Registra chave no histórico persistente com expiração configurada."""
     agora = time.time() if agora is None else agora
     estado_persistente.setdefault("dedup", {})[chave] = agora + ttl_segundos
-    salvar_estado_persistente(estado_persistente, caminho_estado)
+    if salvar:
+        salvar_estado_persistente(estado_persistente, caminho_estado)
 
 
-def registrar_alerta_enviado(estado_persistente, item_alerta, caminho_estado=ARQUIVO_ESTADO):
+def registrar_alerta_enviado(estado_persistente, item_alerta, caminho_estado=ARQUIVO_ESTADO, salvar=True):
     """Adiciona item aos últimos alertas e salva o estado."""
     estado_persistente.setdefault("ultimos", []).append(item_alerta)
-    salvar_estado_persistente(estado_persistente, caminho_estado)
+    if salvar:
+        salvar_estado_persistente(estado_persistente, caminho_estado)
 
 
 def garantir_stats_do_dia(estado_persistente, data_hoje=None):
@@ -787,6 +825,24 @@ def extrair_cupons(texto):
     return cupons
 
 
+REGEX_PARCELAMENTO = re.compile(
+    r"(?i)\b((?:[2-9]|1\d|2[0-4])\s*x\s*"
+    r"(?:(?:de\s*)?(?:r\$\s*)?\d[\d\.]*(?:,\d{1,2})?\s*)?"
+    r"(?:sem\s+juros|s/\s*juros)"
+    r"(?:\s*(?:de\s*)?(?:r\$\s*)?\d[\d\.]*(?:,\d{1,2})?)?)\b"
+)
+
+
+def extrair_parcelamento(texto):
+    """Extrai menção de parcelamento sem juros (ex: '10x de R$ 120,00 sem juros')."""
+    if not texto:
+        return None
+    match = REGEX_PARCELAMENTO.search(texto)
+    if not match:
+        return None
+    return re.sub(r"\s+", " ", match.group(1)).strip()
+
+
 def formatar_texto_alerta_html(texto_bruto, cupons):
     """Escapa HTML do post e destaca os cupons encontrados em <code> para cópia com 1 toque."""
     texto_seguro = html.escape(texto_bruto)
@@ -1178,6 +1234,7 @@ def montar_mensagem_e_botoes_spec(
     chave_silenciar=None,
     tipo_gatilho=None,
     alvo_gatilho=None,
+    buscando_titulo=False,
 ):
     """Monta HTML completo, legenda <= 1000 chars (para fotos) e especificação dos botões."""
     cabecalho = [
@@ -1188,6 +1245,9 @@ def montar_mensagem_e_botoes_spec(
     if cupons:
         cupons_html = " ".join(f"<code>{html.escape(c)}</code>" for c in cupons)
         cabecalho.append(f"🎟️ <b>Cupom(ns):</b> {cupons_html}")
+    parcelamento = extrair_parcelamento(texto_bruto)
+    if parcelamento:
+        cabecalho.append(f"💳 <b>Parcelamento:</b> {html.escape(parcelamento)}")
     cabecalho.append(f"📢 <b>Grupo:</b> {html.escape(nome_grupo)}")
     if info_produto and info_produto.get("loja"):
         cabecalho.append(f"🏪 <b>Loja:</b> {html.escape(info_produto['loja'])}")
@@ -1195,6 +1255,8 @@ def montar_mensagem_e_botoes_spec(
     if titulo_detectado:
         preco_txt = f" — <b>R$ {preco_detectado:.2f}</b>" if preco_detectado else ""
         cabecalho.append(f"🏷️ <b>Produto:</b> {html.escape(titulo_detectado)}{preco_txt}")
+    elif buscando_titulo:
+        cabecalho.append("⏳ <i>Buscando título e preço do produto...</i>")
 
     corpo = [formatar_texto_alerta_html(texto_bruto, cupons)]
     if texto_recuperado:
@@ -1273,17 +1335,70 @@ def ler_ultimas_linhas_log(qtd=30, caminho_log=ARQUIVO_LOG):
     return [linha.rstrip("\r\n") for linha in linhas[-qtd:]]
 
 
+def barra_progresso(valor, max_valor, blocos=5):
+    """Gera barra visual em emojis proporcional ao total analisado."""
+    if not max_valor or max_valor <= 0 or valor <= 0:
+        return "⬜" * blocos
+    preenchido = min(blocos, max(1, round((valor / max_valor) * blocos)))
+    return ("🟩" * preenchido) + ("⬜" * (blocos - preenchido))
+
+
 def formatar_resumo_diario(stats, data_str=None):
-    """Monta texto HTML do resumo diário."""
+    """Monta texto HTML do resumo diário com barras visuais."""
     data_exib = data_str or stats.get("data", datetime.date.today().isoformat())
+    total = stats.get("mensagens_lidas", 0)
+    alertas = stats.get("alertas_enviados", 0)
+    dups = stats.get("duplicatas_barradas", 0)
+    neg = stats.get("bloqueios_negativos", 0)
+    dnd = stats.get("bloqueios_dnd", 0)
     return (
         f"📊 <b>Resumo Diário ({html.escape(data_exib)})</b>\n\n"
-        f"• Mensagens analisadas: <b>{stats.get('mensagens_lidas', 0)}</b>\n"
-        f"• Alertas enviados: <b>{stats.get('alertas_enviados', 0)}</b>\n"
-        f"• Duplicatas barradas: <b>{stats.get('duplicatas_barradas', 0)}</b>\n"
-        f"• Bloqueios negativos/filtros: <b>{stats.get('bloqueios_negativos', 0)}</b>\n"
-        f"• Silenciados na madrugada (DND): <b>{stats.get('bloqueios_dnd', 0)}</b>"
+        f"• Mensagens analisadas: <b>{total}</b>\n"
+        f"• Alertas enviados: <b>{alertas}</b> {barra_progresso(alertas, total)}\n"
+        f"• Duplicatas barradas: <b>{dups}</b> {barra_progresso(dups, total)}\n"
+        f"• Bloqueios/filtros: <b>{neg}</b> {barra_progresso(neg, total)}\n"
+        f"• Silenciados na madrugada (DND): <b>{dnd}</b>"
     )
+
+
+ALIASES_LOJA_SNOOZE = {
+    "ml": "mercado livre",
+    "mercadolivre": "mercado livre",
+    "amz": "amazon",
+    "ali": "aliexpress",
+    "shp": "shopee",
+    "magazineluiza": "magalu",
+}
+
+
+def normalizar_loja_snooze(nome):
+    """Normaliza apelidos comuns de lojas para /snooze."""
+    limpo = (nome or "").strip().lower()
+    return ALIASES_LOJA_SNOOZE.get(limpo, limpo)
+
+
+def loja_em_snooze(info_produto, url_oferta, snooze_lojas, agora=None):
+    """Verifica se a loja identificada (ou domínio host do link) está temporariamente silenciada."""
+    if not snooze_lojas:
+        return None
+    agora = time.time() if agora is None else agora
+
+    expiradas = [k for k, exp in snooze_lojas.items() if exp <= agora]
+    for k in expiradas:
+        del snooze_lojas[k]
+
+    loja = ((info_produto or {}).get("loja") or "").lower()
+    if loja and loja in snooze_lojas:
+        return loja
+
+    if url_oferta:
+        url_com_esquema = url_oferta if "://" in url_oferta else f"https://{url_oferta}"
+        host = urllib.parse.urlparse(url_com_esquema).netloc.split(":")[0].lower()
+        for loja_snz in snooze_lojas:
+            termo = loja_snz.replace(" ", "")
+            if termo and termo in host:
+                return loja_snz
+    return None
 
 
 def remover_itens_lista(lista, argumento, case_insensitive=False, normalizar_fn=None, separar_espacos=False):
@@ -1401,11 +1516,28 @@ def montar_painel_menu_spec(banco, estado_runtime, estado_persistente):
     crit_txt = "OFF" if desc_crit >= 100 or desc_min <= 0 else f"≥{desc_crit:.0f}%"
     min_txt = "OFF" if desc_min <= 0 else f"≥{desc_min:.0f}%"
 
+    snooze_lojas = estado_runtime.get("snooze_lojas")
+    agora_snz = time.time()
+    if isinstance(snooze_lojas, dict):
+        for loja_exp in [k for k, v in snooze_lojas.items() if v <= agora_snz]:
+            del snooze_lojas[loja_exp]
+        qtd_snooze = len(snooze_lojas)
+    else:
+        qtd_snooze = 0
+
+    linha_snooze = ""
+    if qtd_snooze > 0:
+        nomes_snz = ", ".join(html.escape(k.title()) for k in list(snooze_lojas.keys())[:3])
+        if qtd_snooze > 3:
+            nomes_snz += f" +{qtd_snooze - 3}"
+        linha_snooze = f"• 😴 <b>Snooze ({qtd_snooze}):</b> {nomes_snz}\n"
+
     texto = (
         f"🎛️ <b>Painel de Controle</b>\n\n"
         f"• Estado: <b>{'⏸️ Pausado' if pausado else '✅ Ativo'}</b> | Canais: <b>{len(banco.get('canais', []))}</b>\n"
         f"• Hoje: <b>{stats['mensagens_lidas']}</b> lidas | <b>{stats['alertas_enviados']}</b> alertas | <b>{stats['duplicatas_barradas']}</b> dup.\n"
-        f"• Prioridade Alta: Teto=<b>{prio.get('teto', 'alta').upper()}</b> | Combo=<b>{prio.get('combo', 'alta').upper()}</b> | Queda Alta=<b>{crit_txt}</b> (Normal {min_txt})\n\n"
+        f"• Prioridade Alta: Teto=<b>{prio.get('teto', 'alta').upper()}</b> | Combo=<b>{prio.get('combo', 'alta').upper()}</b> | Queda Alta=<b>{crit_txt}</b> (Normal {min_txt})\n"
+        f"{linha_snooze}\n"
         f"<i>Toque nos botões abaixo para configurar sem digitar:</i>"
     )
 
@@ -1416,6 +1548,8 @@ def montar_painel_menu_spec(banco, estado_runtime, estado_persistente):
         [("inline", "⚡ Prioridades e Faixas", "prio:main"), ("inline", "💾 Backup", "menu:backup")],
         [("inline", "🕘 Últimos", "menu:ultimos"), ("inline", "📄 Logs", "menu:logs"), ("inline", "❓ Atalhos", "menu:ajuda")],
     ]
+    if qtd_snooze > 0:
+        botoes_spec.append([("inline", f"🔔 Limpar Snooze ({qtd_snooze})", "menu:limpar_snooze")])
     return texto, botoes_spec
 
 
