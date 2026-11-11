@@ -1,0 +1,13 @@
+.env
+*.session
+*.session-journal
+banco_de_dados.json
+logs/
+__pycache__/
+*.pyc
+ssh-key-*.key
+*.key
+bot_bugs.py
+cd.txt
+*.pdf
+
