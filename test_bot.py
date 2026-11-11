@@ -1490,6 +1490,11 @@ class BotTests(unittest.TestCase):
         self.assertFalse(core.avaliar_gatilhos(post_teclado, banco_pc)["disparar"])
         self.assertFalse(core.avaliar_gatilhos(post_url_pc, banco_pc)["disparar"])
         self.assertTrue(core.avaliar_gatilhos(post_pc_real, banco_pc)["disparar"])
+        self.assertFalse(core.avaliar_gatilhos("Notebook R$ 2.500 com frete de graça hoje", banco_pc)["disparar"])
+        self.assertEqual(
+            core.escolher_link_oferta(["https://www.youtube.com/watch?v=123", "https://amzn.to/loja"]),
+            "https://amzn.to/loja",
+        )
 
         # 2. Editor visual do período DND (/dnd e callbacks)
         with tempfile.TemporaryDirectory() as tmp:
@@ -1761,6 +1766,114 @@ class BotTests(unittest.TestCase):
                 await bot.enviar_em_partes_fn(fake_send_html, texto_html, parse_mode="html")
                 self.assertGreater(len(enviadas_html), 1)
                 self.assertTrue(all(txt and len(txt) <= 3900 and pm == "html" for txt, pm in enviadas_html))
+
+            asyncio.run(rodar())
+
+    def test_atalho_exclusao_apos_criar_e_comando_exc(self):
+        class FakeCallbackReply(FakeCallback):
+            def __init__(self, data, buttons=None):
+                super().__init__(data)
+                self.respostas = []
+                self._buttons = buttons or []
+
+            async def reply(self, text, **kwargs):
+                self.respostas.append((text, kwargs))
+                return FakeSentMessage(text, kwargs)
+
+            async def get_message(self):
+                botoes_obj = [
+                    [
+                        types.SimpleNamespace(
+                            text=b.get("text", ""),
+                            data=b["data"] if isinstance(b.get("data"), bytes) else str(b.get("data", "")).encode("utf-8"),
+                        )
+                        for b in row
+                    ]
+                    for row in self._buttons
+                ]
+                return types.SimpleNamespace(buttons=botoes_obj)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "inicio": time.time(), "aguardando": None}
+            est_pers = core.carregar_estado_persistente(est_path)
+            mapa_sil = {}
+
+            async def rodar():
+                # 1. Atalho pós-criação para canal, palavra, bloqueio e teto
+                for cmd, esperado_data, verificar_presenca, verificar_ausencia in [
+                    ("/ac @canal_rapido", "stop:g:", lambda: "@canal_rapido" in banco["canais"], lambda: "@canal_rapido" not in banco["canais"]),
+                    ("/ap promo_rapida", "stop:p:", lambda: "promo_rapida" in banco["palavras"], lambda: "promo_rapida" not in banco["palavras"]),
+                    ("/ab spam_rapido", "stop:b:", lambda: "spam_rapido" in banco["negativas"], lambda: "spam_rapido" not in banco["negativas"]),
+                    ("/at headset_rapido, 100-300", "stop:t:", lambda: "headset_rapido" in banco["alvos_preco"], lambda: "headset_rapido" not in banco["alvos_preco"]),
+                ]:
+                    ev = FakeEvent(cmd)
+                    await bot.processar_comando_painel(ev, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                    self.assertTrue(verificar_presenca())
+                    botoes = ev.respostas[0][1]["buttons"]
+                    data_btn = botoes[0][0]["data"]
+                    data_str = data_btn.decode("utf-8") if isinstance(data_btn, bytes) else data_btn
+                    self.assertTrue(data_str.startswith(esperado_data))
+
+                    cb_stop = FakeCallbackReply(data_str, buttons=botoes)
+                    await bot.processar_callback_painel(cb_stop, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                    self.assertTrue(verificar_ausencia())
+                    self.assertIn("Parou de monitorar", cb_stop.answers[0][0])
+
+                # 2. Combo criado com /ax oferece botões "+ Exclusão" e "Excluir Combo"
+                ev_ax = FakeEvent("/ax pcgamer | \\bpc\\b + gamer | ps5, ps4, xbox | 300-3000")
+                await bot.processar_comando_painel(ev_ax, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                botoes_combo = ev_ax.respostas[0][1]["buttons"]
+                self.assertEqual(len(botoes_combo[0]), 2)
+                data_cmbx = botoes_combo[0][0]["data"].decode("utf-8")
+                data_stop_c = botoes_combo[0][1]["data"].decode("utf-8")
+                self.assertTrue(data_cmbx.startswith("cmbx:"))
+                self.assertTrue(data_stop_c.startswith("stop:c:"))
+
+                # Tocar em "🚫 + Exclusão" entra no wizard rápido e rejeita regex perigosa/genérica
+                cb_exc = FakeCallbackReply(data_cmbx)
+                await bot.processar_callback_painel(cb_exc, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                self.assertEqual(est_run["aguardando"], "combo_exc:pcgamer")
+                self.assertEqual(cb_exc.respostas[0][1]["buttons"][0][0]["data"], b"wiz:cancel")
+
+                ev_mix = FakeEvent("microfone, .*, (a+)+$")
+                await bot.processar_comando_painel(ev_mix, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertEqual(est_run["aguardando"], "combo_exc:pcgamer")
+                self.assertIn("microfone", banco["alvos_compostos"][0]["excluir"])
+
+                ev_ok = FakeEvent("teclado, mouse")
+                await bot.processar_comando_painel(ev_ok, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIsNone(est_run["aguardando"])
+                self.assertTrue(ev_ok.respostas[0][1]["buttons"][0][0]["data"].startswith(b"cmbx:"))
+
+                # 3. Comando /exc e alias /addexc acrescentam sem duplicar (case-insensitive)
+                ev_cmd_exc = FakeEvent("/exc pcgamer gabinete, MICROFONE")
+                await bot.processar_comando_painel(ev_cmd_exc, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                ev_alias = FakeEvent("/addexc pcgamer | monitor, fonte")
+                await bot.processar_comando_painel(ev_alias, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+
+                exc_finais = banco["alvos_compostos"][0]["excluir"]
+                self.assertEqual(
+                    exc_finais,
+                    ["ps5", "ps4", "xbox", "microfone", "teclado", "mouse", "gabinete", "monitor", "fonte"],
+                )
+                av = core.avaliar_gatilhos("Monitor PC Gamer 27 por R$ 999", banco)
+                self.assertFalse(av["disparar"])
+
+                # 4. Tocar em "🗑️ Excluir Combo" apaga o combo e clicar "+ Exclusão" depois não quebra
+                cb_del_c = FakeCallbackReply(data_stop_c, buttons=botoes_combo)
+                await bot.processar_callback_painel(cb_del_c, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                self.assertEqual(banco["alvos_compostos"], [])
+
+                cb_exc_sumiu = FakeCallbackReply(data_cmbx)
+                await bot.processar_callback_painel(cb_exc_sumiu, banco, cfg, est_run, est_pers, mapa_sil, fake_bot, json_path, est_path, log_path)
+                self.assertIn("não encontrado", cb_exc_sumiu.answers[0][0])
 
             asyncio.run(rodar())
 

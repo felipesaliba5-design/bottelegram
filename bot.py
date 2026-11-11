@@ -93,6 +93,8 @@ ALIASES_COMANDO = {
     "/dt": "/delteto",
     "/ax": "/addcomposto",
     "/dx": "/delcomposto",
+    "/addexc": "/exc",
+    "/excluir": "/exc",
     "/sd": "/setdesconto",
     "/prio": "/prioridade",
     "/t": "/teste",
@@ -114,6 +116,7 @@ COMANDOS_BOT_MENU = [
     ("pausar", "Pausar ou retomar monitoramento"),
     ("addteto", "Teto simples: /addteto item, min-max"),
     ("addcomposto", "Combo: /addcomposto nome | inc | exc | min-max"),
+    ("exc", "Adicionar exclusão a combo: /exc nome t1, t2"),
     ("addpalavra", "Adicionar palavra(s): /ap t1; t2"),
     ("delpalavra", "Remover palavra por nº ou texto: /dp 1"),
     ("addcanal", "Adicionar canal(is): /ac @c1 @c2"),
@@ -229,6 +232,7 @@ def _formatar_texto_ajuda():
         "• <code>/ab termo</code> | <code>/db 1</code> (bloqueios)\n"
         "• <code>/at item, 400-1300</code> | <code>/dt 1</code> (tetos simples)\n"
         "• <code>/ax nome | ter1 + ter2 | ex1, ex2 | 120-220</code> | <code>/dx 1</code> (combos)\n"
+        "• <code>/exc nome t1, t2</code> (adicionar exclusões a um combo)\n"
         "• <code>/sd 65, 75</code> (ou <code>/prio queda 65 75</code>)\n"
         "• <code>/dnd 0-7</code> (ou <code>off</code>) | <code>/filtro usados on|off</code> | <code>/res 21</code>"
     )
@@ -343,7 +347,7 @@ def _normalizar_canal(item):
     return novo
 
 
-def _adicionar_regex_lote(banco, chave, argumento, caminho_json=ARQUIVO_JSON):
+def _adicionar_regex_lote(banco, chave, argumento, caminho_json=ARQUIVO_JSON, criados_out=None):
     """Adiciona uma ou várias expressões (separadas por ';' ou quebra de linha) com validação."""
     itens = [x.strip() for x in re.split(r"[;\n]+", argumento) if x.strip()]
     adicionados, ja_existiam, invalidos = [], [], []
@@ -363,6 +367,8 @@ def _adicionar_regex_lote(banco, chave, argumento, caminho_json=ARQUIVO_JSON):
 
     if adicionados:
         salvar_dados(banco, caminho_json)
+        if criados_out is not None:
+            criados_out.extend(adicionados)
 
     partes = []
     if adicionados:
@@ -378,7 +384,7 @@ def _adicionar_regex_lote(banco, chave, argumento, caminho_json=ARQUIVO_JSON):
     return len(invalidos) == 0, "\n".join(partes)
 
 
-def _executar_add_canal(banco, argumento, caminho_json=ARQUIVO_JSON):
+def _executar_add_canal(banco, argumento, caminho_json=ARQUIVO_JSON, criados_out=None):
     itens = [_normalizar_canal(x) for x in re.split(r"[\s,;]+", argumento) if x.strip()]
     if not itens:
         return False, "⚠️ Informe ao menos um canal (ex.: <code>@ofertasbr</code>)."
@@ -393,6 +399,8 @@ def _executar_add_canal(banco, argumento, caminho_json=ARQUIVO_JSON):
             existentes.append(novo)
     if adicionados:
         salvar_dados(banco, caminho_json)
+        if criados_out is not None:
+            criados_out.extend(adicionados)
     msgs = []
     if adicionados:
         msgs.append(f"✅ Adicionado(s): {', '.join(f'<code>{html.escape(c)}</code>' for c in adicionados)}")
@@ -401,7 +409,7 @@ def _executar_add_canal(banco, argumento, caminho_json=ARQUIVO_JSON):
     return True, "\n".join(msgs)
 
 
-def _executar_add_teto(banco, argumento, caminho_json=ARQUIVO_JSON):
+def _executar_add_teto(banco, argumento, caminho_json=ARQUIVO_JSON, criados_out=None):
     try:
         produto, faixa_str = [x.strip() for x in argumento.split(",", 1)]
         valida, erro = regex_valida(produto)
@@ -415,6 +423,8 @@ def _executar_add_teto(banco, argumento, caminho_json=ARQUIVO_JSON):
             del banco["alvos_preco"][k_ant]
         banco["alvos_preco"][produto] = {"min": min_p, "max": max_p} if min_p > 0 else max_p
         salvar_dados(banco, caminho_json)
+        if criados_out is not None:
+            criados_out.append(produto)
         return (
             True,
             f"🎯 <b>Teto adicionado!</b> Disparo para <b>{html.escape(produto)}</b> ({formatar_faixa_preco(min_p, max_p)})",
@@ -426,7 +436,7 @@ def _executar_add_teto(banco, argumento, caminho_json=ARQUIVO_JSON):
         )
 
 
-def _executar_add_combo(banco, argumento, caminho_json=ARQUIVO_JSON):
+def _executar_add_combo(banco, argumento, caminho_json=ARQUIVO_JSON, criados_out=None):
     try:
         composto = parsear_comando_composto(argumento)
         banco["alvos_compostos"] = [
@@ -434,6 +444,8 @@ def _executar_add_combo(banco, argumento, caminho_json=ARQUIVO_JSON):
         ]
         banco["alvos_compostos"].append(composto)
         salvar_dados(banco, caminho_json)
+        if criados_out is not None:
+            criados_out.append(composto["nome"])
         exc_txt = ", ".join(composto["excluir"]) if composto["excluir"] else "nenhuma"
         return (
             True,
@@ -449,6 +461,88 @@ def _executar_add_combo(banco, argumento, caminho_json=ARQUIVO_JSON):
             f"⚠️ <b>Formato incorreto</b> ({html.escape(str(err))}).\n"
             "Use: <code>ram16 | 16gb + ddr4 | notebook, sodimm | 120-220</code>",
         )
+
+
+def _executar_add_exclusao_combo(banco, nome_alvo, texto_termos, caminho_json=ARQUIVO_JSON):
+    """Acrescenta termos de exclusão em um combo existente sem precisar reescrever o /ax inteiro."""
+    nome_busca = (nome_alvo or "").strip()
+    compostos = banco.get("alvos_compostos", [])
+    alvo = next((c for c in compostos if c.get("nome") == nome_busca), None)
+    if alvo is None:
+        alvo = next((c for c in compostos if (c.get("nome") or "").lower() == nome_busca.lower()), None)
+    if not alvo:
+        return False, f"⚠️ Combo <b>{html.escape(nome_busca)}</b> não encontrado.", None
+
+    itens = [x.strip() for x in re.split(r"[,;\n]+", texto_termos or "") if x.strip()]
+    if not itens:
+        return (
+            False,
+            "⚠️ Informe ao menos um termo de exclusão (ex.: <code>microfone, teclado</code>).",
+            alvo["nome"],
+        )
+
+    existentes = alvo.setdefault("excluir", [])
+    existentes_lower = {x.lower() for x in existentes}
+    adicionados, ja_existiam, invalidos = [], [], []
+    for item in itens:
+        valida, erro = regex_valida(item)
+        if not valida:
+            invalidos.append(f"{item} ({erro})")
+            continue
+        if regex_generica_demais(item):
+            invalidos.append(f"{item} (genérica demais)")
+            continue
+        if item.lower() in existentes_lower:
+            ja_existiam.append(item)
+            continue
+        existentes.append(item)
+        existentes_lower.add(item.lower())
+        adicionados.append(item)
+
+    if adicionados:
+        salvar_dados(banco, caminho_json)
+
+    partes = []
+    if adicionados:
+        partes.append(
+            f"🚫 <b>Exclusão adicionada em {html.escape(alvo['nome'])}:</b> "
+            f"{', '.join(f'<code>{html.escape(x)}</code>' for x in adicionados)}"
+        )
+    if ja_existiam:
+        partes.append(f"ℹ️ Já existia(m): {', '.join(f'<code>{html.escape(x)}</code>' for x in ja_existiam)}")
+    if invalidos:
+        partes.append(f"⚠️ Inválida(s): {', '.join(html.escape(x) for x in invalidos)}")
+    exc_atual = ", ".join(existentes) if existentes else "nenhuma"
+    partes.append(f"• Exclui agora: <code>{html.escape(exc_atual)}</code>")
+    return len(invalidos) == 0, "\n".join(partes), alvo["nome"]
+
+
+def _botoes_pos_criacao_spec(codigo_tipo, itens):
+    """Gera botões inline de atalho rápido logo após criar uma regra ou combo."""
+    if not itens:
+        return []
+    if codigo_tipo == "c":
+        h = hash_curto_chave(itens[0])
+        return [[("inline", "🚫 + Exclusão", f"cmbx:{h}"), ("inline", "🗑️ Excluir Combo", f"stop:c:{h}")]]
+    if codigo_tipo == "t":
+        h = hash_curto_chave(itens[0])
+        return [[("inline", f"🗑️ Excluir: {itens[0][:18]}", f"stop:t:{h}")]]
+    if codigo_tipo in ("p", "b", "g"):
+        botoes = [
+            ("inline", f"🗑️ Excluir: {item[:18]}", f"stop:{codigo_tipo}:{hash_curto_chave(item)}")
+            for item in itens[:4]
+        ]
+        return [botoes[i:i + 2] for i in range(0, len(botoes), 2)]
+    return []
+
+
+async def _responder_com_atalhos_criacao(event, msg, codigo_tipo, criados):
+    """Envia confirmação de criação/edição com botões inline de atalho rápido."""
+    spec = _botoes_pos_criacao_spec(codigo_tipo, criados) if codigo_tipo and criados else []
+    if spec:
+        await event.reply(msg, parse_mode="html", buttons=converter_botoes_telethon(spec))
+    else:
+        await event.reply(msg, parse_mode="html")
 
 
 async def _executar_teste_sistema(send_fn, cfg):
@@ -793,17 +887,30 @@ async def _enviar_backup(send_fn, bot_client, chat_id, caminho_json=ARQUIVO_JSON
 
 
 async def _responder_wizard_add(event, estado_runtime, banco, tipo_acao, texto, caminho_json=ARQUIVO_JSON):
-    """Processa texto digitado pelo usuário durante o fluxo interativo ➕ Adicionar."""
+    """Processa texto digitado pelo usuário durante o fluxo interativo ➕ Adicionar e atalhos."""
+    criados = []
+    cod_btn = None
     if tipo_acao == "add:palavra":
-        ok, msg = _adicionar_regex_lote(banco, "palavras", texto, caminho_json)
+        ok, msg = _adicionar_regex_lote(banco, "palavras", texto, caminho_json, criados_out=criados)
+        cod_btn = "p"
     elif tipo_acao == "add:bloqueio":
-        ok, msg = _adicionar_regex_lote(banco, "negativas", texto, caminho_json)
+        ok, msg = _adicionar_regex_lote(banco, "negativas", texto, caminho_json, criados_out=criados)
+        cod_btn = "b"
     elif tipo_acao == "add:canal":
-        ok, msg = _executar_add_canal(banco, texto, caminho_json)
+        ok, msg = _executar_add_canal(banco, texto, caminho_json, criados_out=criados)
+        cod_btn = "g"
     elif tipo_acao == "add:teto":
-        ok, msg = _executar_add_teto(banco, texto, caminho_json)
+        ok, msg = _executar_add_teto(banco, texto, caminho_json, criados_out=criados)
+        cod_btn = "t"
     elif tipo_acao == "add:combo":
-        ok, msg = _executar_add_combo(banco, texto, caminho_json)
+        ok, msg = _executar_add_combo(banco, texto, caminho_json, criados_out=criados)
+        cod_btn = "c"
+    elif tipo_acao.startswith("combo_exc:"):
+        nome_combo = tipo_acao.split(":", 1)[1]
+        ok, msg, combo_resolvido = _executar_add_exclusao_combo(banco, nome_combo, texto, caminho_json)
+        if combo_resolvido:
+            criados.append(combo_resolvido)
+            cod_btn = "c"
     else:
         estado_runtime["aguardando"] = None
         estado_runtime["aguardando_ate"] = None
@@ -812,7 +919,7 @@ async def _responder_wizard_add(event, estado_runtime, banco, tipo_acao, texto, 
     if ok:
         estado_runtime["aguardando"] = None
         estado_runtime["aguardando_ate"] = None
-        await event.reply(msg, parse_mode="html")
+        await _responder_com_atalhos_criacao(event, msg, cod_btn, criados)
     else:
         await event.reply(
             f"{msg}\n\n<i>Tente novamente ou toque em ❌ Cancelar:</i>",
@@ -1101,8 +1208,9 @@ async def processar_comando_painel(
         if not argumento:
             await event.reply("💡 Use: <code>/ac @canal</code> ou vários: <code>/ac @canal1 @canal2</code>", parse_mode="html")
             return
-        _, msg = _executar_add_canal(banco, argumento, caminho_json)
-        await event.reply(msg, parse_mode="html")
+        criados = []
+        _, msg = _executar_add_canal(banco, argumento, caminho_json, criados_out=criados)
+        await _responder_com_atalhos_criacao(event, msg, "g", criados)
 
     elif comando == "/delcanal":
         if not argumento:
@@ -1124,8 +1232,9 @@ async def processar_comando_painel(
         if not argumento:
             await event.reply("💡 Use: <code>/ap termo</code> ou vários: <code>/ap termo1; termo2</code>", parse_mode="html")
             return
-        _, msg = _adicionar_regex_lote(banco, "palavras", argumento, caminho_json)
-        await event.reply(msg, parse_mode="html")
+        criados = []
+        _, msg = _adicionar_regex_lote(banco, "palavras", argumento, caminho_json, criados_out=criados)
+        await _responder_com_atalhos_criacao(event, msg, "p", criados)
 
     elif comando == "/delpalavra":
         if not argumento:
@@ -1149,8 +1258,9 @@ async def processar_comando_painel(
         if not argumento:
             await event.reply("💡 Use: <code>/ab termo</code> ou vários: <code>/ab termo1; termo2</code>", parse_mode="html")
             return
-        _, msg = _adicionar_regex_lote(banco, "negativas", argumento, caminho_json)
-        await event.reply(msg, parse_mode="html")
+        criados = []
+        _, msg = _adicionar_regex_lote(banco, "negativas", argumento, caminho_json, criados_out=criados)
+        await _responder_com_atalhos_criacao(event, msg, "b", criados)
 
     elif comando == "/delbloqueio":
         if not argumento:
@@ -1170,8 +1280,9 @@ async def processar_comando_painel(
         if not argumento:
             await event.reply("💡 Use: <code>/at placa de vídeo, 400-1300</code> ou <code>/at ssd, 300</code>", parse_mode="html")
             return
-        _, msg = _executar_add_teto(banco, argumento, caminho_json)
-        await event.reply(msg, parse_mode="html")
+        criados = []
+        _, msg = _executar_add_teto(banco, argumento, caminho_json, criados_out=criados)
+        await _responder_com_atalhos_criacao(event, msg, "t", criados)
 
     elif comando == "/delteto":
         if not argumento:
@@ -1199,8 +1310,33 @@ async def processar_comando_painel(
                 parse_mode="html",
             )
             return
-        _, msg = _executar_add_combo(banco, argumento, caminho_json)
-        await event.reply(msg, parse_mode="html")
+        criados = []
+        _, msg = _executar_add_combo(banco, argumento, caminho_json, criados_out=criados)
+        await _responder_com_atalhos_criacao(event, msg, "c", criados)
+
+    elif comando == "/exc":
+        if not argumento:
+            await event.reply(
+                "💡 Use: <code>/exc nome_combo termo1, termo2</code>\n"
+                "Ex.: <code>/exc pcgamer microfone, teclado</code>",
+                parse_mode="html",
+            )
+            return
+        if "|" in argumento:
+            nome_combo, termos = [x.strip() for x in argumento.split("|", 1)]
+        else:
+            partes_exc = re.split(r"\s+", argumento, maxsplit=1)
+            nome_combo = partes_exc[0].strip()
+            termos = partes_exc[1].strip() if len(partes_exc) > 1 else ""
+        if not termos:
+            await event.reply(
+                "💡 Informe os termos após o nome do combo.\n"
+                f"Ex.: <code>/exc {html.escape(nome_combo)} microfone, teclado</code>",
+                parse_mode="html",
+            )
+            return
+        _, msg, combo_resolvido = _executar_add_exclusao_combo(banco, nome_combo, termos, caminho_json)
+        await _responder_com_atalhos_criacao(event, msg, "c", [combo_resolvido] if combo_resolvido else [])
 
     elif comando == "/delcomposto":
         if not argumento:
@@ -1368,7 +1504,7 @@ async def _substituir_botao_alerta(event, novo_rotulo):
 
 
 def _parar_monitorar_por_hash(banco, codigo_tipo, hash_alvo, caminho_json=ARQUIVO_JSON):
-    """Remove palavra, teto ou combo pelo código de tipo e hash curto do alvo."""
+    """Remove palavra, bloqueio, canal, teto ou combo pelo código de tipo e hash curto do alvo."""
     if codigo_tipo == "p":
         alvo = next((p for p in banco.get("palavras", []) if hash_curto_chave(p) == hash_alvo), None)
         if not alvo:
@@ -1377,6 +1513,22 @@ def _parar_monitorar_por_hash(banco, codigo_tipo, hash_alvo, caminho_json=ARQUIV
         altas = banco.get("prioridades", {}).get("palavras_altas", [])
         if alvo in altas:
             altas.remove(alvo)
+        salvar_dados(banco, caminho_json)
+        return alvo
+
+    if codigo_tipo == "b":
+        alvo = next((b for b in banco.get("negativas", []) if hash_curto_chave(b) == hash_alvo), None)
+        if not alvo:
+            return None
+        banco["negativas"].remove(alvo)
+        salvar_dados(banco, caminho_json)
+        return alvo
+
+    if codigo_tipo == "g":
+        alvo = next((g for g in banco.get("canais", []) if hash_curto_chave(g) == hash_alvo), None)
+        if not alvo:
+            return None
+        banco["canais"].remove(alvo)
         salvar_dados(banco, caminho_json)
         return alvo
 
@@ -1484,7 +1636,7 @@ async def processar_callback_painel(
             await event.answer("Loja inválida.")
         return
 
-    # 1b. Parar de monitorar o gatilho direto do alerta
+    # 1b. Parar de monitorar o gatilho direto do alerta / pós-criação
     if data.startswith("stop:"):
         partes = data.split(":")
         if len(partes) == 3:
@@ -1496,6 +1648,27 @@ async def processar_callback_painel(
             else:
                 await _substituir_botao_alerta(event, "✅ Já removido")
                 await event.answer("Esse gatilho já havia sido removido.")
+        return
+
+    # 1b-2. Atalho rápido para adicionar exclusão ao combo recém-criado
+    if data.startswith("cmbx:"):
+        hash_alvo = data.split(":", 1)[1]
+        alvo = next((c for c in banco.get("alvos_compostos", []) if hash_curto_chave(c["nome"]) == hash_alvo), None)
+        if not alvo:
+            await event.answer("⚠️ Combo não encontrado (talvez já removido).", alert=True)
+            return
+        estado_runtime["aguardando"] = f"combo_exc:{alvo['nome']}"
+        estado_runtime["aguardando_ate"] = time.time() + 300
+        exc_atual = ", ".join(alvo.get("excluir") or []) or "nenhuma"
+        await event.reply(
+            f"🚫 <b>Adicionar exclusão ao combo <code>{html.escape(alvo['nome'])}</code></b>\n"
+            f"• Atuais: <code>{html.escape(exc_atual)}</code>\n\n"
+            "Envie os novos termos separados por vírgula ou <code>;</code> "
+            "(ex.: <code>microfone, teclado</code>):",
+            parse_mode="html",
+            buttons=converter_botoes_telethon([[("inline", "❌ Cancelar", "wiz:cancel")]]),
+        )
+        await event.answer()
         return
 
     # 1c. Fluxos interativos Adicionar / Remover (wiz:*)

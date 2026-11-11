@@ -92,8 +92,9 @@ Ao iniciar, o bot registra os comandos automaticamente no menu `/` do Telegram. 
 | `/addcanal` (`/ac @c1 @c2`) / `/delcanal` (`/dc 1`) | Adiciona em lote ou remove por nº/nome |
 | `/addpalavra` (`/ap t1; t2`) / `/delpalavra` (`/dp 1, 3`) | Adiciona em lote ou remove por nº/texto |
 | `/addbloqueio` (`/ab t1; t2`) / `/delbloqueio` (`/db 1`) | Adiciona em lote ou remove por nº/texto |
-| `/addteto` (`/at item, 400-1300`) / `/delteto` (`/dt 1`) | Define faixa min-max (ou só máx) e remove por nº/nome |
-| `/addcomposto` (`/ax nome \| ter1 + ter2 \| ex \| 120-220`) / `/delcomposto` (`/dx 1`) | Cria regra composta e remove por nº/nome |
+| `/addteto` (`/at item, 400-1300`) / `/delteto` (`/dt 1`) | Define faixa min-max (ou só máx) e remove por nº/nome *(com botão rápido de excluir após criar)* |
+| `/addcomposto` (`/ax nome \| ter1 + ter2 \| ex \| 120-220`) / `/delcomposto` (`/dx 1`) | Cria regra composta e remove por nº/nome *(com botões `+ Exclusão` e `Excluir Combo` após criar)* |
+| `/exc` (`/addexc nome t1, t2`) | Acrescenta novas exclusões a um combo existente sem reescrever o `/ax` inteiro |
 | `/setdesconto` (`/sd 65, 75`) | Define mínimo normal e crítico para MacroDroid (`off` desativa crítico, `0` desativa tudo) |
 | `/dnd` / `/dnd 23-7` / `/dnd off` | Abre editor visual por botões ou ajusta o horário do Não Perturbe |
 | `/filtro usados on\|off` / `/filtro importacao on\|off` | Liga/desliga bloqueio automático de usados e importações |

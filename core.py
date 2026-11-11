@@ -752,6 +752,7 @@ def _limpar_texto_para_gatilhos(texto):
         " ",
         limpo,
     )
+    limpo = re.sub(r"(?i)\b(?:frete|entrega|envio)\s+de\s+gra[çc]a\b", " ", limpo)
     return re.sub(r"[ \t]+", " ", limpo)
 
 
@@ -1437,8 +1438,20 @@ def extrair_links_mensagem(raw_text, entities=None, text_url_cls=None):
 
 
 def escolher_link_oferta(links):
-    """Prioriza links de lojas em vez de convites de Telegram/WhatsApp."""
-    dominios_sociais = ("t.me/", "telegram.me/", "wa.me/", "chat.whatsapp.com/")
+    """Prioriza links de lojas em vez de convites de Telegram/WhatsApp ou redes sociais."""
+    dominios_sociais = (
+        "t.me/",
+        "telegram.me/",
+        "wa.me/",
+        "chat.whatsapp.com/",
+        "youtube.com/",
+        "youtu.be/",
+        "instagram.com/",
+        "tiktok.com/",
+        "twitter.com/",
+        "x.com/",
+        "facebook.com/",
+    )
     for link in links:
         lower = link.lower()
         if not any(soc in lower for soc in dominios_sociais):
