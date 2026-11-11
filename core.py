@@ -2,10 +2,12 @@ import copy
 import datetime
 import hashlib
 import html
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import tempfile
 import threading
 import time
@@ -125,6 +127,9 @@ PARAMS_TRACKING = {
 }
 
 PARAMS_REDIRECT = ("url", "u", "redir", "redirect", "target", "ued", "destination")
+
+# Somente a suíte de testes liga esta flag para acessar HTTPServer local em 127.0.0.1.
+PERMITIR_REDE_LOCAL = False
 
 REGEX_CUPOM = re.compile(
     r"(?i)(?:"
@@ -301,6 +306,7 @@ def _estado_padrao():
         "dedup": {},
         "ultimos": [],
         "ultimo_resumo_data": "",
+        "por_canal": {},
         "stats_dia": {
             "data": datetime.date.today().isoformat(),
             "mensagens_lidas": 0,
@@ -313,7 +319,7 @@ def _estado_padrao():
 
 
 def carregar_estado_persistente(caminho_estado=ARQUIVO_ESTADO):
-    """Carrega histórico de deduplicação, últimos alertas e estatísticas diárias."""
+    """Carrega histórico de deduplicação, últimos alertas, ranking por canal e estatísticas diárias."""
     base = _estado_padrao()
     if not os.path.exists(caminho_estado):
         return base
@@ -329,6 +335,11 @@ def carregar_estado_persistente(caminho_estado=ARQUIVO_ESTADO):
     base["dedup"] = {k: float(v) for k, v in dedup_raw.items() if float(v) > agora}
     base["ultimos"] = list(lido.get("ultimos", []))[-20:]
     base["ultimo_resumo_data"] = lido.get("ultimo_resumo_data", "")
+    base["por_canal"] = {
+        str(nome): {"lidas": int(d.get("lidas", 0)), "alertas": int(d.get("alertas", 0))}
+        for nome, d in (lido.get("por_canal") or {}).items()
+        if isinstance(d, dict)
+    }
 
     hoje = datetime.date.today().isoformat()
     stats_lido = lido.get("stats_dia", {})
@@ -931,6 +942,58 @@ def _url_bloqueio_ou_login(url):
     )
 
 
+def url_destino_publico(url):
+    """Anti-SSRF: True só se a URL é http(s) e TODOS os IPs do host são públicos."""
+    if PERMITIR_REDE_LOCAL:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(url)
+        esquema = parsed.scheme.lower()
+        if esquema not in ("http", "https") or not parsed.hostname:
+            return False
+        porta = parsed.port or (443 if esquema == "https" else 80)
+        infos = socket.getaddrinfo(parsed.hostname, porta, proto=socket.IPPROTO_TCP)
+        enderecos = {info[4][0].split("%")[0] for info in infos}
+        if not enderecos:
+            return False
+        for ip_str in enderecos:
+            ip = ipaddress.ip_address(ip_str)
+            ip = getattr(ip, "ipv4_mapped", None) or ip
+            if (
+                not ip.is_global
+                or ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return False
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+class _RedirecionamentoSeguro(urllib.request.HTTPRedirectHandler):
+    """Valida cada salto de redirect: impede que um link público aponte para a rede interna."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        destino = urllib.parse.urljoin(req.full_url, newurl)
+        if not url_destino_publico(destino):
+            raise urllib.error.URLError(f"Redirect para destino não público bloqueado: {destino}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER_SEGURO = urllib.request.build_opener(_RedirecionamentoSeguro)
+
+
+def _abrir_url_segura(req, timeout):
+    """Substitui urllib.request.urlopen para links vindos de canais (não confiáveis)."""
+    if not url_destino_publico(req.full_url):
+        raise urllib.error.URLError(f"Destino não público bloqueado: {req.full_url}")
+    return _OPENER_SEGURO.open(req, timeout=timeout)
+
+
 def expandir_link(url, timeout=4):
     """Expande encurtadores (Amazon, ML, Shopee, Magalu, Kabum, AliExpress) seguindo redirects."""
     url_inicial = _desembrulhar_query_redirect(url)
@@ -947,7 +1010,7 @@ def expandir_link(url, timeout=4):
     for metodo in ("HEAD", "GET"):
         try:
             req = urllib.request.Request(url_atual, headers=headers, method=metodo)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _abrir_url_segura(req, timeout) as resp:
                 candidata = _desembrulhar_query_redirect(resp.geturl())
                 if not _url_bloqueio_ou_login(candidata):
                     url_final = candidata
@@ -1118,7 +1181,7 @@ def buscar_metadados_pagina(url, timeout=4):
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "pt-BR,pt;q=0.9"}
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _abrir_url_segura(req, timeout) as resp:
             conteudo = resp.read(65536).decode("utf-8", errors="ignore")
     except Exception:
         return {"titulo": None, "preco": None}

@@ -79,6 +79,7 @@ Ao iniciar, o bot registra os comandos automaticamente no menu `/` do Telegram. 
 | `/ajuda` (`/h`) | Lista todos os comandos e atalhos |
 | `/lista` (`/l`) | Mostra listas numeradas (para remover pelo número) |
 | `/status` (`/s`) | Estado atual, tempo online e estatísticas do dia |
+| `/ranking` (`/rank`) | Ranking dos canais que mais geram alertas vs. canais mudos |
 | `/ping` | Verifica se o bot está vivo na VPS/Termux e mede a latência |
 | `/teste` (`/t`) | Envia alerta simulado com botões e testa o MacroDroid |
 | `/simular` (`/sim texto`) | Simula extração (preço, desconto, parcelamento, cupom) e mostra se a regra dispararia |

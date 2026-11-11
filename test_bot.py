@@ -92,6 +92,15 @@ def _instalar_stub_telethon():
 
 _instalar_stub_telethon()
 
+# Testes não podem depender de um .env real presente no diretório do projeto.
+for _k, _v in {
+    "API_ID": "1",
+    "API_HASH": "hash-teste",
+    "BOT_TOKEN": "token-teste",
+    "MEU_CHAT_ID": "777",
+}.items():
+    os.environ.setdefault(_k, _v)
+
 import bot  # noqa: E402
 import core  # noqa: E402
 from telethon.tl.types import MessageEntityTextUrl  # noqa: E402
@@ -169,6 +178,12 @@ class FakeCallback:
 
 
 class BotTests(unittest.TestCase):
+    def setUp(self):
+        core.PERMITIR_REDE_LOCAL = True
+
+    def tearDown(self):
+        core.PERMITIR_REDE_LOCAL = False
+
     def test_env_e_configuracoes(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_path = os.path.join(tmp, ".env")
@@ -988,6 +1003,303 @@ class BotTests(unittest.TestCase):
                 ev_blk = FakeEvent("/simular esgotado BUG R$ 10")
                 await bot.processar_comando_painel(ev_blk, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
                 self.assertIn("IGNORADO / BLOQUEADO", ev_blk.respostas[0][0])
+
+            asyncio.run(rodar())
+
+    def test_anti_ssrf_bloqueia_rede_local_e_redirect(self):
+        import urllib.error
+        import urllib.request
+
+        core.PERMITIR_REDE_LOCAL = False
+        try:
+            for ruim in (
+                "http://127.0.0.1:8080/admin",
+                "http://localhost/teste",
+                "http://192.168.1.1/",
+                "http://10.0.0.5/",
+                "http://169.254.169.254/latest/meta-data",
+                "http://[::1]/",
+                "http://[::ffff:127.0.0.1]/",
+                "file:///etc/passwd",
+                "ftp://example.com/a",
+            ):
+                self.assertFalse(core.url_destino_publico(ruim), msg=f"Deveria bloquear: {ruim}")
+
+            req = urllib.request.Request("https://exemplo.com/short")
+            with self.assertRaises(urllib.error.URLError):
+                core._RedirecionamentoSeguro().redirect_request(
+                    req, None, 302, "Found", {}, "http://127.0.0.1:8000/interno"
+                )
+
+            hits = []
+
+            class SpyHandler(http.server.BaseHTTPRequestHandler):
+                def do_HEAD(self):
+                    hits.append(("HEAD", self.path))
+                    self.send_response(200)
+                    self.end_headers()
+
+                def do_GET(self):
+                    hits.append(("GET", self.path))
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"<title>Secreto</title>")
+
+                def log_message(self, format, *args):
+                    return
+
+            server = http.server.HTTPServer(("127.0.0.1", 0), SpyHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/probe"
+                self.assertEqual(core.expandir_link(url), url)
+                self.assertEqual(core.buscar_metadados_pagina(url), {"titulo": None, "preco": None})
+                self.assertEqual(hits, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+        finally:
+            core.PERMITIR_REDE_LOCAL = True
+
+    def test_qa_m2_m3_b1_b2_validacoes_wizard_e_backup(self):
+        import bot_bugs
+
+        # B2: corte seguro sem quebrar entidade HTML nem exceder LIMITE_CORPO
+        corpo = bot_bugs._preparar_corpo("&" * 1200)
+        self.assertLessEqual(len(corpo), bot_bugs.LIMITE_CORPO)
+        self.assertTrue(corpo.endswith("&amp;"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            core.salvar_dados(banco, json_path)
+            fake_bot = FakeBotClient()
+            cfg = {"MEU_CHAT_ID": 777, "URL_MACRODROID": "", "TEMPO_SILENCIO_HORAS": 3}
+            est_run = {"pausado": False, "inicio": time.time(), "aguardando": None, "aguardando_ate": None}
+            est_pers = core.carregar_estado_persistente(est_path)
+
+            async def rodar():
+                # M2: regex genérica rejeitada
+                for pat in (".*", ".", r"\w+", r"\s+"):
+                    ev_gen = FakeEvent(f"/ap {pat}")
+                    await bot.processar_comando_painel(ev_gen, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                    self.assertIn("genérica demais", ev_gen.respostas[0][0])
+
+                ev_val = FakeEvent(r"/ap \bssd_novo\b")
+                await bot.processar_comando_painel(ev_val, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn(r"\bssd_novo\b", banco["palavras"])
+
+                # B1: /cancelar sem pendência vs com pendência + sugestão de comando errado
+                ev_canc_vazio = FakeEvent("/cancelar")
+                await bot.processar_comando_painel(ev_canc_vazio, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Nenhuma operação pendente", ev_canc_vazio.respostas[0][0])
+
+                cb_add = FakeCallback("wiz:add:p")
+                await bot.processar_callback_painel(cb_add, banco, cfg, est_run, est_pers, {}, fake_bot, json_path, est_path, log_path)
+                self.assertEqual(est_run["aguardando"], "add:palavra")
+                self.assertIsNotNone(est_run["aguardando_ate"])
+
+                ev_canc = FakeEvent("/cancelar")
+                await bot.processar_comando_painel(ev_canc, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Operação cancelada", ev_canc.respostas[0][0])
+                self.assertIsNone(est_run["aguardando"])
+
+                # M2: expiração do assistente após 5 min
+                await bot.processar_callback_painel(cb_add, banco, cfg, est_run, est_pers, {}, fake_bot, json_path, est_path, log_path)
+                est_run["aguardando_ate"] = time.time() - 10
+                ev_exp = FakeEvent("oi")
+                await bot.processar_comando_painel(ev_exp, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("expirou", ev_exp.respostas[0][0])
+                self.assertNotIn("oi", banco["palavras"])
+
+                # B1: comando desconhecido sugere comando próximo
+                ev_typo = FakeEvent("/liste")
+                await bot.processar_comando_painel(ev_typo, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("/lista", ev_typo.respostas[0][0])
+
+                # M3: backup inválido em alvos_preco, regex ou combo é recusado sem alterar banco
+                qtd_canais_antes = len(banco["canais"])
+                invalidos = [
+                    {"canais": ["@c"], "palavras": ["bug"], "negativas": [], "alvos_preco": []},
+                    {"canais": ["@c"], "palavras": ["[invalida"], "negativas": []},
+                    {"canais": ["@c"], "palavras": ["bug"], "negativas": [], "alvos_compostos": [{"nome": "x"}]},
+                    {"canais": ["@c"], "palavras": ["bug"], "negativas": [], "desconto_minimo": True},
+                ]
+                for payload in invalidos:
+                    ev_bak = FakeEvent(
+                        document=True,
+                        file_name="bad.json",
+                        doc_bytes=json.dumps(payload).encode("utf-8"),
+                    )
+                    await bot.processar_backup_recebido(ev_bak, banco, json_path)
+                    self.assertIn("Falha ao restaurar JSON", ev_bak.respostas[0][0])
+                    self.assertEqual(len(banco["canais"]), qtd_canais_antes)
+
+            asyncio.run(rodar())
+
+    def test_fluxo_cacador_macrodroid_dedup_digest_ranking_e_sentinela(self):
+        from unittest.mock import patch
+
+        class FakeCanalEvent:
+            def __init__(self, chat_id, msg_id, title, username, text, entities=None):
+                self.chat_id = chat_id
+                self.id = msg_id
+                self.raw_text = text
+                self.entities = entities or []
+                self.photo = None
+                self.is_private = False
+                self.out = False
+                self._chat = types.SimpleNamespace(title=title, username=username)
+
+            async def get_chat(self):
+                return self._chat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "banco.json")
+            est_path = os.path.join(tmp, "estado.json")
+            log_path = os.path.join(tmp, "bot.log")
+            banco = core.carregar_dados(json_path)
+            banco["canais"] = ["@canalteste"]
+            banco["palavras"].append(r"\boferta_normal\b")
+            core.salvar_dados(banco, json_path)
+
+            cfg = {
+                "MEU_CHAT_ID": 777,
+                "URL_MACRODROID": "https://trigger.macrodroid.com/teste/bug",
+                "TEMPO_DE_ESPERA": 0,
+                "TEMPO_DUPLICATA": 900,
+                "TEMPO_SILENCIO_HORAS": 3,
+            }
+            est_pers = core.carregar_estado_persistente(est_path)
+            memoria = {}
+            mapa_sil = {}
+
+            async def rodar():
+                lock = asyncio.Lock()
+                est_run = {
+                    "ultimo_disparo": 0.0,
+                    "pausado": False,
+                    "inicio": time.time(),
+                    "aguardando": None,
+                    "aguardando_ate": None,
+                    "snooze_lojas": {},
+                    "ultima_leitura": time.time(),
+                    "adiados": [],
+                    "save_lock": lock,
+                }
+                eventos_ordem = []
+                falhar_envio = {"ativo": False}
+
+                class BotClientOrdem(FakeBotClient):
+                    async def send_message(self, chat_id, text, **kwargs):
+                        if falhar_envio["ativo"]:
+                            raise RuntimeError("Telegram indisponivel")
+                        macrodroid_iniciado = bool(eventos_ordem and eventos_ordem[0][0] == "macrodroid") or any(
+                            "_acionar_macrodroid" in repr(t.get_coro()) for t in bot._TAREFAS_BG
+                        )
+                        eventos_ordem.append(("telegram", macrodroid_iniciado))
+                        return await super().send_message(chat_id, text, **kwargs)
+
+                fake_bot = BotClientOrdem()
+                fake_user = FakeUserClient()
+
+                def fake_macrodroid(url, link):
+                    eventos_ordem.append(("macrodroid", link))
+                    return 200
+
+                # M1 + F3: MacroDroid parte antes do envio ao Telegram e atualiza ranking por canal
+                ev_bug = FakeCanalEvent(
+                    -100123,
+                    10,
+                    "Canal Teste",
+                    "canalteste",
+                    "BUG SSD NVMe R$ 50 https://www.amazon.com.br/dp/B09V3KXJPB?ref=teste1234567890",
+                )
+                with patch("bot.disparar_macrodroid", side_effect=fake_macrodroid):
+                    await bot.processar_mensagem_cacador(
+                        ev_bug, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
+                    )
+                    for _ in range(20):
+                        if any(e[0] == "macrodroid" for e in eventos_ordem):
+                            break
+                        await asyncio.sleep(0.01)
+
+                tg_evt = next(e for e in eventos_ordem if e[0] == "telegram")
+                self.assertTrue(tg_evt[1])
+                self.assertTrue(any(e[0] == "macrodroid" for e in eventos_ordem))
+                self.assertEqual(est_pers["por_canal"]["Canal Teste"], {"lidas": 1, "alertas": 1})
+
+                # M1: falha ao entregar no Telegram libera chave de duplicata para o repost
+                falhar_envio["ativo"] = True
+                ev_repost = FakeCanalEvent(
+                    -100123,
+                    11,
+                    "Canal Teste",
+                    "canalteste",
+                    "BUG Monitor 4K R$ 99 https://www.amazon.com.br/dp/B09V3REPOST?ref=teste1234567890",
+                )
+                with patch("bot.disparar_macrodroid", side_effect=fake_macrodroid):
+                    await bot.processar_mensagem_cacador(
+                        ev_repost, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
+                    )
+                self.assertEqual(len(est_pers["dedup"]), 1)  # apenas o 1o alerta continua no dedup
+
+                falhar_envio["ativo"] = False
+                with patch("bot.disparar_macrodroid", side_effect=fake_macrodroid):
+                    await bot.processar_mensagem_cacador(
+                        ev_repost, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
+                    )
+                self.assertEqual(len(est_pers["dedup"]), 2)
+
+                # F3: comando /ranking exibe canal com taxa e /ranking mudo
+                ev_rank = FakeEvent("/rank")
+                await bot.processar_comando_painel(ev_rank, banco, cfg, est_run, est_pers, fake_bot, json_path, log_path)
+                self.assertIn("Canal Teste", ev_rank.respostas[0][0])
+
+                # F2: DND guarda oferta normal em adiados e envia Digest quando DND termina
+                hora_atual = datetime.datetime.now().hour
+                banco["nao_perturbe"] = {"ativo": True, "inicio": hora_atual, "fim": (hora_atual + 1) % 24}
+                ev_norm = FakeCanalEvent(
+                    -100123,
+                    12,
+                    "Canal Teste",
+                    "canalteste",
+                    "oferta_normal Mouse Gamer https://www.amazon.com.br/dp/B09MOUSE123?ref=teste1234567890",
+                )
+                await bot.processar_mensagem_cacador(
+                    ev_norm, fake_user, fake_bot, cfg, banco, est_run, est_pers, memoria, mapa_sil, est_path
+                )
+                self.assertEqual(len(est_run["adiados"]), 1)
+
+                banco["nao_perturbe"]["ativo"] = False
+                chamadas_d = {"n": 0}
+
+                async def sleep_digest(_):
+                    chamadas_d["n"] += 1
+                    if chamadas_d["n"] >= 2:
+                        raise asyncio.CancelledError()
+
+                with patch("bot.asyncio.sleep", side_effect=sleep_digest):
+                    await bot._loop_digest_dnd(fake_bot, cfg, banco, est_run, intervalo=0)
+                self.assertEqual(est_run["adiados"], [])
+                self.assertTrue(any("Digest do Não Perturbe" in m[1] for m in fake_bot.mensagens))
+
+                # F1: Sentinela avisa uma vez quando ultima_leitura passa de limite_horas
+                est_run["ultima_leitura"] = time.time() - (4 * 3600)
+                chamadas_s = {"n": 0}
+
+                async def sleep_sent(_):
+                    chamadas_s["n"] += 1
+                    if chamadas_s["n"] >= 3:
+                        raise asyncio.CancelledError()
+
+                with patch("bot.asyncio.sleep", side_effect=sleep_sent):
+                    await bot._loop_sentinela(fake_bot, cfg, banco, est_run, limite_horas=3.0, intervalo=0)
+                avisos_sent = [m for m in fake_bot.mensagens if "Sentinela:" in m[1]]
+                self.assertEqual(len(avisos_sent), 1)
 
             asyncio.run(rodar())
 
