@@ -1,0 +1,2 @@
+# Dependência do Bot do Telegram
+telethon>=1.36.0

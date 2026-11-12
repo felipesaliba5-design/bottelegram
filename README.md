@@ -1,6 +1,31 @@
 # Bot Caçador de Promoções e Bugs (Telegram)
 
-Bot em Python usando [Telethon](https://docs.telethon.dev/) para monitorar canais e grupos do Telegram em tempo real, filtrar ofertas com alta precisão, expandir links de lojas, destacar cupons e enviar alertas com fotos e botões interativos (além de disparo prioritário para o MacroDroid).
+[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![Telethon](https://img.shields.io/badge/Library-Telethon-2CA5E0?style=flat&logo=telegram&logoColor=white)](https://docs.telethon.dev/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Architecture](https://img.shields.io/badge/Architecture-AsyncIO%20%7C%20Zero--Dep-blue)](core.py)
+[![Tests](https://img.shields.io/badge/Tests-Unit%20Tests%20(Coverage)-success)](test_bot.py)
+
+Sistema em Python assíncrono para monitoramento em tempo real de canais e grupos do Telegram, desenvolvido para detecção, filtragem e enriquecimento de ofertas relâmpago e bugs de preço com priorização multicanal (Telegram e webhook para automação no MacroDroid).
+
+---
+
+## 🎯 Destaques de Engenharia e Boas Práticas
+
+Este projeto foi desenhado focando em performance, baixo consumo de recursos e segurança defensiva:
+
+- **Arquitetura Assíncrona & Reativa (`asyncio` + Telethon)**: processamento não-bloqueante de múltiplos streams de eventos de mensagens (`NewMessage` e `MessageEdited`) via MTProto, com workers assíncronos para tarefas de I/O de rede.
+- **Segurança de Rede Defensiva**:
+  - **Anti-SSRF**: validação rigorosa de endereços IP contra redes privadas, loopback e metadados de nuvem (`169.254.169.254`) antes de qualquer expansão de link HTTP.
+  - **DNS Pinning**: resolução antecipada de nomes e amarração de IP durante redirecionamentos, impedindo ataques de DNS rebinding.
+  - **Mitigação de ReDoS**: sanitização e limites estruturais para expressões regulares dinâmicas cadastradas pelo usuário.
+- **Persistência Confiável e I/O Atômico**: gravação de estado com `fsync` em disco para evitar corrupção de dados em caso de reinicialização abrupta ou falta de energia do host.
+- **Design Desacoplado**:
+  - `core.py`: Lógica de domínio pura (sanitização de links, extração de preços/descontos/cupons, banco de dados JSON e regras de filtragem), desacoplada de frameworks de mensageria.
+  - `bot.py`: Camada de aplicação e apresentação (handlers de comandos, interfaces com botões inline e integração com webhooks).
+- **Testes Automatizados**: suíte extensa de testes unitários com fakes de eventos e stubs para validação isolada de toda a lógica de parsing e fluxo de alertas sem dependência de rede externa.
+
+---
 
 ## Principais Recursos
 
@@ -27,12 +52,12 @@ Bot em Python usando [Telethon](https://docs.telethon.dev/) para monitorar canai
   - Persiste histórico de deduplicação, silenciamentos de 3h, últimos alertas e estatísticas diárias em `estado_bot.json` (resiste a reinícios).
   - Envia **resumo diário automático** (`/resumo 21`) e logs rotativos em `logs/bot.log`.
 
-## Requisitos
+## Instalação e Requisitos
 
 - **Python 3.9+**
-- **Telethon** (única dependência externa):
+- Instalação via `requirements.txt`:
   ```bash
-  pip install telethon
+  pip install -r requirements.txt
   ```
 
 ## Configuração
@@ -103,12 +128,14 @@ Ao iniciar, o bot registra os comandos automaticamente no menu `/` do Telegram. 
 
 ## Estrutura do Projeto
 
-- `bot.py`: clientes Telethon, painel de comandos, callbacks inline, envio de fotos e loop principal.
-- `core.py`: lógica pura (configuração `.env`, banco JSON, persistência de estado, preços, filtros, cupons, links, scraping de título).
+- `bot.py`: interface com Telegram, handlers de eventos e comandos, callbacks inline e loop principal.
+- `core.py`: regras de negócio puras (parsing de preços, cupons, persistência com fsync, anti-SSRF, DNS pinning, ranking).
+- `requirements.txt`: declaração de dependências do projeto.
+- `LICENSE`: termos de licença open-source (MIT).
 - `iniciar_termux.sh`: script de vigília com `termux-wake-lock` e reinício automático no Termux.
-- `.env.example`: modelo das variáveis de ambiente.
-- `.gitignore`: bloqueia `.env`, `*.session*`, `banco_de_dados.json`, `estado_bot.json`, backups `.bak`, chaves e `logs/`.
-- `test_bot.py`: suíte de testes unitários.
+- `.env.example`: modelo documentado das variáveis de ambiente.
+- `.gitignore`: proteção contra commits acidentais de segredos (`.env`, `.session*`, `.key`, logs e bancos locais).
+- `test_bot.py`: suíte completa de testes unitários automatizados.
 
 ## Testes
 
